@@ -20,12 +20,11 @@ class CameraPublisher(Node):
         self.picam2.start()
         time.sleep(0.5)  # Autofocus settling time
         
-        # Publish at 2 Hz (every 0.5 seconds)
-        self.timer = self.create_timer(0.5, self.publish_image)
-        self.get_logger().info('Camera Publisher Node Started')
+        self.get_logger().info('Camera Publisher - Capturing ONE image...')
+        self.capture_once()
 
-    def publish_image(self):
-        # Capture image
+    def capture_once(self):
+        # Capture single image
         frame = self.picam2.capture_array()
         
         # Convert to ROS Image message
@@ -35,14 +34,16 @@ class CameraPublisher(Node):
         
         # Publish
         self.publisher_.publish(msg)
-        self.get_logger().info('Image published')
+        self.get_logger().info('Single image published! Shutting down...')
+        
+        # Cleanup
+        self.picam2.stop()
+        rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
     node = CameraPublisher()
     rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
