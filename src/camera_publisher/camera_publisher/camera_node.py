@@ -4,6 +4,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from picamera2 import Picamera2
 import time
+import cv2
 
 class CameraPublisher(Node):
     def __init__(self):
@@ -26,6 +27,11 @@ class CameraPublisher(Node):
     def capture_once(self):
         # Capture single image
         frame = self.picam2.capture_array()
+        
+        # Save image to file
+        save_path = '/tmp/captured_image.jpg'
+        cv2.imwrite(save_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        self.get_logger().info(f'Image saved to: {save_path}')
         
         # Convert to ROS Image message
         msg = self.bridge.cv2_to_imgmsg(frame, encoding='rgb8')

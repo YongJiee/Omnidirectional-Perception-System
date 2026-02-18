@@ -26,7 +26,9 @@ class OCRProcessor(Node):
         # Convert ROS Image to OpenCV format
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         
-        self.get_logger().info('=== Processing single image ===')
+        save_path = '/tmp/received_image.jpg'
+        cv2.imwrite(save_path, frame)
+        self.get_logger().info(f'Received image saved to: {save_path}')
         
         # Barcode detection
         barcodes = pyzbar.decode(frame)
