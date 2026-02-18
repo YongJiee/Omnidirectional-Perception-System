@@ -19,7 +19,10 @@ class CameraPublisher(Node):
         )
         self.picam2.configure(config)
         self.picam2.start()
-        time.sleep(0.5)  # Autofocus settling time
+        
+        # Trigger autofocus and wait
+        self.picam2.set_controls({"AfMode": 2, "AfTrigger": 0})
+        time.sleep(2.0)  # Wait 2 seconds for autofocus to settle
         
         self.get_logger().info('Camera Publisher - Capturing ONE image...')
         self.capture_once()
