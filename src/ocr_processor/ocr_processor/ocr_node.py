@@ -1,26 +1,24 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
+from sensor_msgs.msg import CompressedImage
 import cv2
 import pytesseract
 from pyzbar import pyzbar
 import re
 import time
+import numpy as np
 
 class OCRProcessor(Node):
     def __init__(self):
         super().__init__('ocr_processor')
         self.subscription = self.create_subscription(
-            Image, 
-            '/camera/image_raw', 
+            CompressedImage,
+            '/camera/image_raw/compressed',
             self.process_image, 
             10
         )
-        self.bridge = CvBridge()
         self.processed = False
-        self.start_time = time.time()
-        self.get_logger().info('OCR Processor - Waiting for image...')
+        self.get_logger().info('OCR Processor - Waiting for compressed image...')
 
     def extract_clean_text(self, text):
         """Extract only meaningful words from OCR text"""
@@ -36,14 +34,19 @@ class OCRProcessor(Node):
         if self.processed:
             return
         
-        # Image receive timing
-        receive_time = time.time() - self.start_time
+        # Get capture timestamp from camera
+        try:
+            camera_capture_time = float(msg.header.frame_id)
+        except:
+            camera_capture_time = None
+        
         processing_start = time.time()
         
-        # Convert timing
-        convert_start = time.time()
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        convert_time = time.time() - convert_start
+        # Decode compressed image
+        decode_start = time.time()
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        decode_time = time.time() - decode_start
         
         # Save timing
         save_start = time.time()
@@ -56,34 +59,35 @@ class OCRProcessor(Node):
         barcodes = pyzbar.decode(frame)
         barcode_time = time.time() - barcode_start
         
-        barcode_data = None
+        barcode_results = []
         if barcodes:
             for barcode in barcodes:
-                barcode_data = barcode.data.decode('utf-8')
-                self.get_logger().info(f'Barcode: [{barcode.type}] {barcode_data}')
+                data = barcode.data.decode('utf-8')
+                barcode_results.append(f'[{barcode.type}] {data}')
         
         # OCR timing
         ocr_start = time.time()
-        
-        # Preprocessing
-        preprocess_start = time.time()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         inverted = 255 - gray
-        preprocess_time = time.time() - preprocess_start
-        
-        # OCR execution
-        tesseract_start = time.time()
         raw_text = pytesseract.image_to_string(inverted, config='--oem 3 --psm 6')
-        tesseract_time = time.time() - tesseract_start
-        
-        # Text processing
-        textprocess_start = time.time()
         clean_text = self.extract_clean_text(raw_text)
-        textprocess_time = time.time() - textprocess_start
-        
         ocr_time = time.time() - ocr_start
         
+        processing_time = time.time() - processing_start
+        
+        # Calculate true end-to-end if we have camera timestamp
+        if camera_capture_time:
+            true_overall = time.time() - camera_capture_time
+        else:
+            true_overall = None
+        
         # Display results
+        self.get_logger().info('\n=== RESULTS ===')
+        if barcode_results:
+            self.get_logger().info(f'Barcodes: {", ".join(barcode_results)}')
+        else:
+            self.get_logger().info('Barcodes: None')
+        
         if clean_text:
             self.get_logger().info(f'OCR Text: {clean_text}')
             
@@ -93,32 +97,29 @@ class OCRProcessor(Node):
             model_match = re.search(r'Model [A-Z]|\d+', clean_text, re.IGNORECASE)
             if model_match:
                 self.get_logger().info(f'✓ Model: {model_match.group()}')
+        else:
+            self.get_logger().info('OCR Text: None')
         
-        # Overall timing
-        processing_time = time.time() - processing_start
-        overall_time = time.time() - self.start_time
-        
-        # Log comprehensive timing
-        self.get_logger().info('\n=== OCR NODE TIMING ===')
-        self.get_logger().info(f'Image receive:      {receive_time:.3f}s')
-        self.get_logger().info(f'ROS convert:        {convert_time:.3f}s')
+        # Log timing
+        self.get_logger().info('\n=== TIMING BREAKDOWN ===')
+        self.get_logger().info(f'JPEG decode:        {decode_time:.3f}s')
         self.get_logger().info(f'Save image:         {save_time:.3f}s')
         self.get_logger().info(f'Barcode detection:  {barcode_time:.3f}s')
-        self.get_logger().info(f'OCR preprocessing:  {preprocess_time:.3f}s')
-        self.get_logger().info(f'Tesseract OCR:      {tesseract_time:.3f}s')
-        self.get_logger().info(f'Text processing:    {textprocess_time:.3f}s')
-        self.get_logger().info(f'Total OCR:          {ocr_time:.3f}s')
-        self.get_logger().info(f'Processing only:    {processing_time:.3f}s')
-        self.get_logger().info(f'Overall (end-to-end): {overall_time:.3f}s')
-        self.get_logger().info('========================')
+        self.get_logger().info(f'OCR processing:     {ocr_time:.3f}s')
+        self.get_logger().info(f'Total processing:   {processing_time:.3f}s')
         
-        # Check 3-second requirement
-        if overall_time < 3.0:
-            margin = 3.0 - overall_time
-            self.get_logger().info(f'✓ PASS: Under 3s requirement (margin: +{margin:.3f}s)')
-        else:
-            exceed = overall_time - 3.0
-            self.get_logger().info(f'✗ FAIL: Exceeds 3s requirement (over by: {exceed:.3f}s)')
+        if true_overall:
+            self.get_logger().info(f'\n=== END-TO-END (Camera→OCR) ===')
+            self.get_logger().info(f'Total time:         {true_overall:.3f}s')
+            
+            if true_overall < 3.0:
+                margin = 3.0 - true_overall
+                self.get_logger().info(f'✓ PASS: {margin:.3f}s under requirement')
+            else:
+                exceed = true_overall - 3.0
+                self.get_logger().info(f'✗ FAIL: {exceed:.3f}s over requirement')
+        
+        self.get_logger().info('====================================')
         
         self.processed = True
         rclpy.shutdown()
