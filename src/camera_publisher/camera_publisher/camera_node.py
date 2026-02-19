@@ -53,6 +53,12 @@ class CameraPublisher(Node):
         _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
         encode_time = time.time() - encode_start
         
+        # Wait for subscriber before publishing
+        self.get_logger().info('Waiting for OCR subscriber...')
+        while self.publisher_.get_subscription_count() == 0:
+            time.sleep(0.1)
+        self.get_logger().info('OCR subscriber detected!')
+        
         # Create CompressedImage message
         publish_start = time.time()
         msg = CompressedImage()
@@ -76,14 +82,15 @@ class CameraPublisher(Node):
         self.get_logger().info(f'Total:       {overall_time:.3f}s')
         self.get_logger().info('==========================')
         
-        # Cleanup
+        # Keep alive briefly after publishing
+        time.sleep(1.0)
         self.picam2.stop()
-        rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
     node = CameraPublisher()
-    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

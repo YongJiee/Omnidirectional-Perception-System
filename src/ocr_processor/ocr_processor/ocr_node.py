@@ -65,12 +65,32 @@ class OCRProcessor(Node):
                 data = barcode.data.decode('utf-8')
                 barcode_results.append(f'[{barcode.type}] {data}')
         
-        # OCR timing
+        # OCR timing with IMPROVED preprocessing (from standalone)
         ocr_start = time.time()
+        
+        # Convert to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        inverted = 255 - gray
-        raw_text = pytesseract.image_to_string(inverted, config='--oem 3 --psm 6')
+        
+        # Downscale if needed (OCR works fine at lower res)
+        height, width = gray.shape
+        if width > 1280:
+            scale = 1280 / width
+            gray = cv2.resize(gray, None, fx=scale, fy=scale)
+        
+        # Use Otsu's thresholding (same as standalone)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Save preprocessed image for debugging
+        cv2.imwrite('/tmp/preprocessed_binary.jpg', binary)
+        
+        # Use same Tesseract config as standalone
+        # PSM 11 = Sparse text (better for labels/barcodes)
+        # OEM 1 = LSTM only (faster)
+        custom_config = r'--oem 1 --psm 11'
+        
+        raw_text = pytesseract.image_to_string(binary, config=custom_config)
         clean_text = self.extract_clean_text(raw_text)
+        
         ocr_time = time.time() - ocr_start
         
         processing_time = time.time() - processing_start
@@ -91,12 +111,18 @@ class OCRProcessor(Node):
         if clean_text:
             self.get_logger().info(f'OCR Text: {clean_text}')
             
+            # Smart product detection
             if 'raspberry' in clean_text.lower() and 'pi' in clean_text.lower():
                 self.get_logger().info('✓ Product: Raspberry Pi')
+            elif 'sephora' in clean_text.lower():
+                self.get_logger().info('✓ Product: SEPHORA')
+            elif 'lego' in clean_text.lower():
+                self.get_logger().info('✓ Product: LEGO')
             
-            model_match = re.search(r'Model [A-Z]|\d+', clean_text, re.IGNORECASE)
+            # Model detection
+            model_match = re.search(r'Model [A-Z]|\d+|V\d+', clean_text, re.IGNORECASE)
             if model_match:
-                self.get_logger().info(f'✓ Model: {model_match.group()}')
+                self.get_logger().info(f'✓ Model/Version: {model_match.group()}')
         else:
             self.get_logger().info('OCR Text: None')
         
