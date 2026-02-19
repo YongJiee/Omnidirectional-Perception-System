@@ -12,38 +12,61 @@ class CameraPublisher(Node):
         self.publisher_ = self.create_publisher(Image, '/camera/image_raw', 10)
         self.bridge = CvBridge()
         
+        # Start overall timing
+        self.overall_start = time.time()
+        
         # Initialize Picamera2
+        init_start = time.time()
         self.picam2 = Picamera2()
         config = self.picam2.create_still_configuration(
             main={"size": (1920, 1080)}
         )
         self.picam2.configure(config)
         self.picam2.start()
+        init_time = time.time() - init_start
         
-        # Trigger autofocus and wait
+        # Autofocus timing
+        af_start = time.time()
         self.picam2.set_controls({"AfMode": 2, "AfTrigger": 0})
-        time.sleep(2.0)  # Wait 2 seconds for autofocus to settle
+        time.sleep(2.0)
+        af_time = time.time() - af_start
         
-        self.get_logger().info('Camera Publisher - Capturing ONE image...')
+        self.get_logger().info(f'Camera init: {init_time:.3f}s')
+        self.get_logger().info(f'Autofocus: {af_time:.3f}s')
+        self.get_logger().info('Capturing image...')
+        
         self.capture_once()
 
     def capture_once(self):
-        # Capture single image
+        # Capture timing
+        capture_start = time.time()
         frame = self.picam2.capture_array()
+        capture_time = time.time() - capture_start
         
-        # Save image to file
+        # Save timing
+        save_start = time.time()
         save_path = '/tmp/captured_image.jpg'
         cv2.imwrite(save_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        self.get_logger().info(f'Image saved to: {save_path}')
+        save_time = time.time() - save_start
         
-        # Convert to ROS Image message
+        # Publish timing
+        publish_start = time.time()
         msg = self.bridge.cv2_to_imgmsg(frame, encoding='rgb8')
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'camera_frame'
-        
-        # Publish
         self.publisher_.publish(msg)
-        self.get_logger().info('Single image published! Shutting down...')
+        publish_time = time.time() - publish_start
+        
+        # Overall timing
+        overall_time = time.time() - self.overall_start
+        
+        # Log timing breakdown
+        self.get_logger().info('=== CAMERA NODE TIMING ===')
+        self.get_logger().info(f'Capture:     {capture_time:.3f}s')
+        self.get_logger().info(f'Save image:  {save_time:.3f}s')
+        self.get_logger().info(f'ROS publish: {publish_time:.3f}s')
+        self.get_logger().info(f'Overall:     {overall_time:.3f}s')
+        self.get_logger().info('==========================')
         
         # Cleanup
         self.picam2.stop()
