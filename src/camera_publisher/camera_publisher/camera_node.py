@@ -4,20 +4,28 @@ from sensor_msgs.msg import CompressedImage
 from picamera2 import Picamera2
 import time
 import cv2
+import os
+from datetime import datetime
 
 class CameraPublisher(Node):
     def __init__(self):
         super().__init__('camera_publisher')
         self.publisher_ = self.create_publisher(CompressedImage, '/camera/image_raw/compressed', 10)
         
+        # Create timestamped folder for this run
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.save_dir = os.path.expanduser(f'~/camera_captures/single/{timestamp}')
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.get_logger().info(f'Saving images to: {self.save_dir}')
+
         # Start overall timing
         self.overall_start = time.time()
         
-        # Initialize Picamera2 with lower resolution
+        # Initialize Picamera2 explicitly on Camera 0 (Arducam adapter)
         init_start = time.time()
-        self.picam2 = Picamera2()
+        self.picam2 = Picamera2(0)
         config = self.picam2.create_still_configuration(
-            main={"size": (1280, 720)}  # Reduced from 1920x1080
+            main={"size": (1280, 720)}
         )
         self.picam2.configure(config)
         self.picam2.start()
@@ -41,11 +49,15 @@ class CameraPublisher(Node):
         frame = self.picam2.capture_array()
         capture_time = time.time() - capture_start
         
-        # Convert and save local copy
-        save_start = time.time()
+        # Convert
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        cv2.imwrite('/tmp/captured_image.jpg', frame_bgr)
+
+        # Save to timestamped folder
+        save_start = time.time()
+        save_path = os.path.join(self.save_dir, 'camera_0.jpg')
+        cv2.imwrite(save_path, frame_bgr)
         save_time = time.time() - save_start
+        self.get_logger().info(f'Saved: {save_path}')
         
         # Encode as JPEG
         encode_start = time.time()
