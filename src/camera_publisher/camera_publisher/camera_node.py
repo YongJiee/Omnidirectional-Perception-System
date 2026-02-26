@@ -21,9 +21,20 @@ class CameraPublisher(Node):
         # Start overall timing
         self.overall_start = time.time()
         
-        # Initialize Picamera2 explicitly on Camera 0 (Arducam adapter)
+        # Auto-detect available cameras
         init_start = time.time()
-        self.picam2 = Picamera2(0)
+        available = Picamera2.global_camera_info()
+        self.get_logger().info(f'Available cameras: {len(available)}')
+        
+        if len(available) == 0:
+            self.get_logger().error('No cameras detected! Check connections.')
+            raise RuntimeError('No cameras detected')
+        
+        # Use first available camera
+        camera_num = available[0]['Num']
+        self.get_logger().info(f'Using camera index: {camera_num}')
+        
+        self.picam2 = Picamera2(camera_num)
         config = self.picam2.create_still_configuration(
             main={"size": (1280, 720)}
         )

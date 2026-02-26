@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'ocr_node = ocr_processor.ocr_node:main',
+            'database_matcher_node = ocr_processor.database_matcher_node:main',
         ],
     },
 )

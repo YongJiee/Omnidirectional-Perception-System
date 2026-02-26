@@ -6,17 +6,30 @@ def generate_launch_description():
     pi_host = 'team9camera@172.20.10.2'
     
     return LaunchDescription([
-        # Start OCR node first
+        # Start database matcher node first
         Node(
             package='ocr_processor',
-            executable='ocr_node',
-            name='ocr_processor',
+            executable='database_matcher_node',
+            name='database_matcher',
             output='screen',
         ),
-        
-        # Wait 2 seconds for OCR to initialize, then start camera
+
+        # Start OCR node second
         TimerAction(
-            period=2.0,
+            period=1.0,
+            actions=[
+                Node(
+                    package='ocr_processor',
+                    executable='ocr_node',
+                    name='ocr_processor',
+                    output='screen',
+                ),
+            ]
+        ),
+        
+        # Wait 3 seconds total, then start camera on Pi
+        TimerAction(
+            period=3.0,
             actions=[
                 ExecuteProcess(
                     cmd=[

@@ -7,10 +7,13 @@ from pyzbar import pyzbar
 import re
 import time
 import numpy as np
+from std_msgs.msg import String
+import json
 
 class OCRProcessor(Node):
     def __init__(self):
         super().__init__('ocr_processor')
+        self.result_publisher = self.create_publisher(String, 'ocr_results', 10)
         self.subscription = self.create_subscription(
             CompressedImage,
             '/camera/image_raw/compressed',
@@ -26,7 +29,7 @@ class OCRProcessor(Node):
         clean = []
         for word in words:
             cleaned = re.sub(r'[^\w]', '', word)
-            if len(cleaned) >= 2 and any(c.isalpha() for c in cleaned):
+            if len(cleaned) >= 2:
                 clean.append(cleaned)
         return ' '.join(clean)
 
@@ -146,6 +149,13 @@ class OCRProcessor(Node):
                 self.get_logger().info(f'✗ FAIL: {exceed:.3f}s over requirement')
         
         self.get_logger().info('====================================')
+        result_msg = json.dumps({
+        'ocr_text': clean_text,
+        'barcode': barcode_results[0] if barcode_results else None
+        })
+        self.result_publisher.publish(String(data=result_msg))
+        self.get_logger().info('Published OCR result to /ocr_results')
+
         
         self.processed = True
         rclpy.shutdown()
