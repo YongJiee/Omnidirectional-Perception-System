@@ -17,7 +17,7 @@ class DatabaseMatcherNode(Node):
 
         self.subscription = self.create_subscription(
             String,
-            'ocr_results',
+            '/ocr_results',   # updated to match new OCR node publisher topic
             self.match_callback,
             10
         )
@@ -25,11 +25,44 @@ class DatabaseMatcherNode(Node):
         self.matcher = SmartMatcher(device_id='PI-001', location='Warehouse')
         self.get_logger().info('Database Matcher Node ready')
 
+    # ---------------------------------------------------------------
+    # Parse barcode from new format {'type': ..., 'data': ...}
+    # or old format '[CODE128] ABC-123' for backwards compatibility
+    # ---------------------------------------------------------------
+    def parse_barcodes(self, raw_barcode):
+        """
+        Accepts:
+          - dict:  {'type': 'CODE128', 'data': 'ABC-123'}
+          - str:   '[CODE128] ABC-123'
+          - list:  [dict, ...] or [str, ...]
+          - None
+        Returns: list of barcode data strings e.g. ['ABC-123']
+        """
+        if raw_barcode is None:
+            return []
+
+        # Wrap single item in list
+        if not isinstance(raw_barcode, list):
+            raw_barcode = [raw_barcode]
+
+        barcodes = []
+        for rb in raw_barcode:
+            if isinstance(rb, dict):
+                # New format from updated OCR node
+                data = rb.get('data', '').strip()
+                if data:
+                    barcodes.append(data)
+            elif isinstance(rb, str):
+                # Old format '[CODE128] ABC-123'
+                match = re.search(r'\] (.+)$', rb)
+                barcodes.append(match.group(1) if match else rb)
+
+        return barcodes
+
+    # ---------------------------------------------------------------
+    # Check if top 2 products score too close (tie detection)
+    # ---------------------------------------------------------------
     def check_tie(self, ocr_text, products):
-        """
-        Check if top 2 products score too close to each other.
-        Returns True if tie detected, False if clear winner.
-        """
         scores = []
         for product in products:
             _, _, score, _ = self.matcher._enhanced_fuzzy_match(ocr_text, None, [product])
@@ -52,11 +85,10 @@ class DatabaseMatcherNode(Node):
 
         return False
 
+    # ---------------------------------------------------------------
+    # Guard: check OCR text has recognisable product words
+    # ---------------------------------------------------------------
     def is_meaningful_ocr(self, ocr_text):
-        """
-        Check if OCR text contains any recognisable product-related words.
-        Prevents garbage/short text from triggering false matches.
-        """
         if len(ocr_text.strip()) < 4:
             return False
 
@@ -76,88 +108,92 @@ class DatabaseMatcherNode(Node):
         return False
 
     def get_ocr_details(self, ocr_text):
-        """Run OCR-only fuzzy match and return detail scores."""
         _, _, _, details = self.matcher._enhanced_fuzzy_match(
             ocr_text, None, self.matcher.db.get_all_products()
         )
         return details
 
-    def log_timing(self, callback_start, camera_overall_start, camera_capture_start):
-        """Log full timing breakdown including camera init+focus."""
+    # ---------------------------------------------------------------
+    # Timing log — works with both old and new format
+    # ---------------------------------------------------------------
+    def log_timing(self, callback_start, overall_start, end_to_end_from_ocr, mode):
         matcher_time = time.time() - callback_start
         now = time.time()
 
         self.get_logger().info('\n=== MATCHER TIMING ===')
+        self.get_logger().info(f'  Mode:               {mode}')
         self.get_logger().info(f'  Matcher processing: {matcher_time:.3f}s')
 
-        if camera_overall_start and camera_capture_start:
-            init_focus_time = camera_capture_start - camera_overall_start
-            capture_to_db_time = now - camera_capture_start
-            full_end_to_end = now - camera_overall_start
-
-            self.get_logger().info(f'  ── Camera Breakdown ──')
-            self.get_logger().info(f'  Init + Focus:       {init_focus_time:.3f}s')
-            self.get_logger().info(f'  Capture → Database: {capture_to_db_time:.3f}s')
-            self.get_logger().info(f'  ──────────────────────')
-            self.get_logger().info(f'  FULL end-to-end:    {full_end_to_end:.3f}s  (Init → OCR → Database)')
+        if overall_start:
+            full_end_to_end = now - overall_start
+            self.get_logger().info(f'  FULL end-to-end:    {full_end_to_end:.3f}s  (Pi init → OCR → Database)')
             if full_end_to_end < 3.0:
-                self.get_logger().info(f'  ✓ PASS: {3.0 - full_end_to_end:.3f}s under requirement')
+                self.get_logger().info(f'  ✓ PASS: {3.0 - full_end_to_end:.3f}s under 3s requirement')
             else:
-                self.get_logger().warn(f'  ✗ FAIL: {full_end_to_end - 3.0:.3f}s over requirement')
+                self.get_logger().warn(f'  ✗ FAIL: {full_end_to_end - 3.0:.3f}s over 3s requirement')
 
-        elif camera_overall_start:
-            full_end_to_end = now - camera_overall_start
-            self.get_logger().info(f'  FULL end-to-end:    {full_end_to_end:.3f}s  (Init → OCR → Database)')
-            if full_end_to_end < 3.0:
-                self.get_logger().info(f'  ✓ PASS: {3.0 - full_end_to_end:.3f}s under requirement')
-            else:
-                self.get_logger().warn(f'  ✗ FAIL: {full_end_to_end - 3.0:.3f}s over requirement')
+        # Also log OCR node's own end-to-end if available
+        if end_to_end_from_ocr:
+            self.get_logger().info(f'  OCR node e2e:       {end_to_end_from_ocr:.3f}s')
 
         self.get_logger().info('==================================')
 
+    # ---------------------------------------------------------------
+    # Main callback
+    # ---------------------------------------------------------------
     def match_callback(self, msg):
         callback_start = time.time()
 
         data = json.loads(msg.data)
 
-        ocr_text = data.get('ocr_text', '')
-        camera_overall_start = data.get('camera_overall_start', None)
-        camera_capture_start = data.get('camera_capture_start', None)
+        ocr_text = data.get('ocr_text', '') or ''
+        mode = data.get('mode', '1-camera')
+        cameras_received = data.get('cameras_received', 1)
+        per_camera = data.get('per_camera', {})
 
-        # Backwards compatibility with old frame_id key
-        if camera_overall_start is None:
-            camera_overall_start = data.get('camera_capture_time', None)
-            camera_capture_start = camera_overall_start
+        # Timing — new keys with fallback to old keys
+        overall_start = (
+            data.get('overall_start') or
+            data.get('camera_overall_start') or
+            data.get('camera_capture_time')
+        )
+        end_to_end_from_ocr = data.get('end_to_end_time')
 
-        # Handle barcode as list (multiple reads) or single string
-        raw_barcodes = data.get('barcode', [])
-        if isinstance(raw_barcodes, str):
-            raw_barcodes = [raw_barcodes]
-        elif raw_barcodes is None:
-            raw_barcodes = []
+        # Barcode — parse new dict format or old string format
+        raw_barcode = data.get('barcode')
+        barcodes = self.parse_barcodes(raw_barcode)
 
-        # Strip ROS format e.g. '[CODE128] ABC-abc-1234' -> 'ABC-abc-1234'
-        barcodes = []
-        for rb in raw_barcodes:
-            match = re.search(r'\] (.+)$', rb)
-            barcodes.append(match.group(1) if match else rb)
+        self.get_logger().info(
+            f'Received [{mode}] — '
+            f'Cameras: {cameras_received} | '
+            f'OCR: "{ocr_text[:40]}" | '
+            f'Barcodes: {barcodes}'
+        )
 
-        self.get_logger().info(f'Received — OCR: {ocr_text[:40]} | Barcodes: {barcodes}')
+        # Log per-camera summary if multi-camera
+        if per_camera:
+            self.get_logger().info('Per-camera OCR summary:')
+            for cam_id, cam_result in per_camera.items():
+                cam_ocr = cam_result.get('ocr_text', 'None')
+                cam_barcodes = cam_result.get('barcodes', [])
+                self.get_logger().info(
+                    f'  Cam {cam_id}: OCR="{cam_ocr}" | Barcodes={cam_barcodes}'
+                )
 
-        # Guard: if no barcode and OCR is garbage, skip matching entirely
+        # Guard: skip if no barcode and OCR is garbage
         if not barcodes and not self.is_meaningful_ocr(ocr_text):
             self.get_logger().warn(f'OCR text unrecognisable: "{ocr_text}" — skipping match')
             self.get_logger().info('\n=== DATABASE MATCHING RESULTS ===')
             self.get_logger().warn('✗ NO MATCH FOUND — insufficient OCR data')
-            self.log_timing(callback_start, camera_overall_start, camera_capture_start)
+            self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
             return
 
-        # If no barcode, check for tie first
+        # Tie check if OCR-only
         if not barcodes:
             products = self.matcher.db.get_all_products()
             if self.check_tie(ocr_text, products):
                 self.get_logger().warn('Ambiguous match — barcode required for verification')
-                self.log_timing(callback_start, camera_overall_start, camera_capture_start)
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
                 return
 
         # Try each barcode until one matches
@@ -172,7 +208,7 @@ class DatabaseMatcherNode(Node):
                 barcode_used = barcode
                 break
 
-        # Fall back to OCR-only match if all barcodes failed
+        # Fall back to OCR-only if all barcodes failed
         if not result or not result['matched']:
             result = self.matcher.match_and_save(ocr_text=ocr_text, barcode=None)
 
@@ -198,13 +234,15 @@ class DatabaseMatcherNode(Node):
         else:
             self.get_logger().warn('✗ NO MATCH FOUND')
 
-        self.log_timing(callback_start, camera_overall_start, camera_capture_start)
+        self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = DatabaseMatcherNode()
     rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

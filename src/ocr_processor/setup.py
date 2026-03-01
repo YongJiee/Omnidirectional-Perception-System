@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             'ocr_node = ocr_processor.ocr_node:main',
             'database_matcher_node = ocr_processor.database_matcher_node:main',
+            'test_publisher = ocr_processor.test_image_publisher:main',
         ],
     },
 )
