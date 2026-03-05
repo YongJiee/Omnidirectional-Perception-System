@@ -182,8 +182,8 @@ class SmartMatcher:
 
         if brand_detected and product_detected:
             # Both brand and product detected — 50/50 split
-            print(f"  Mode: Brand + Product (50/50)")
-            base = (brand_score * 0.5) + (product_score * 0.5)
+            print(f"  Mode: Brand + Product (40/50 + 10 keyword)")
+            base = (brand_score * 0.4) + (product_score * 0.5)
 
         elif product_detected and not brand_detected:
             # Product detected but no brand — check if product is unique
@@ -198,13 +198,13 @@ class SmartMatcher:
                 return 0.0
             else:
                 # Product is unique to one brand
-                print(f"  Mode: Product only, unique to one brand (80/20)")
-                base = (product_score * 0.8) + (brand_score * 0.2)
+                print(f"  Mode: Product only, unique to one brand (90 + 10 keyword)")
+                base = product_score * 0.9  # leaves 10% for keyword bonus
 
         elif brand_detected and not product_detected:
             # Brand detected but no product name
-            print(f"  Mode: Brand only (60/40)")
-            base = (brand_score * 0.6) + (product_score * 0.4)
+            print(f"  Mode: Brand only (60 + 10 keyword)")
+            base = brand_score * 0.6  # leaves 10% for keyword bonus
 
         else:
             # Neither brand nor product clearly detected
@@ -212,6 +212,43 @@ class SmartMatcher:
             return 0.0
 
         return min(base + keyword_bonus, 100.0)
+
+    # ==================== OCR SCORE HELPER ====================
+
+    def _get_ocr_scores(self, ocr_lower, product):
+        """
+        Compute real OCR similarity scores independently of barcode.
+        Used to show honest OCR breakdown even when barcode matched.
+        """
+        brand = product[2].lower() if product[2] else ""
+        product_name = product[1].lower() if product[1] else ""
+        keywords = product[4] if product[4] else ""
+
+        brand_score = max(
+            fuzz.partial_ratio(brand, ocr_lower),
+            fuzz.token_sort_ratio(brand, ocr_lower),
+            fuzz.token_set_ratio(brand, ocr_lower)
+        ) if brand else 0.0
+
+        product_score = max(
+            fuzz.partial_ratio(product_name, ocr_lower),
+            fuzz.token_sort_ratio(product_name, ocr_lower)
+        ) if product_name else 0.0
+
+        keyword_list = [kw.strip() for kw in keywords.split(',')] if keywords else []
+        if keyword_list:
+            kw_scores = [fuzz.token_set_ratio(kw.lower(), ocr_lower) for kw in keyword_list]
+            avg = sum(kw_scores) / len(kw_scores)
+            mx = max(kw_scores)
+            keyword_score = avg * 0.6 + mx * 0.4
+        else:
+            keyword_score = 0.0
+
+        return {
+            'brand_score': float(brand_score),
+            'product_score': float(product_score),
+            'keyword_score': float(keyword_score)
+        }
 
     # ==================== ENHANCED MATCHING LOGIC ====================
 
@@ -288,6 +325,7 @@ class SmartMatcher:
             print(f"\n  Match Accuracy: {accuracy_percentage:.1f}%")
             print(f"  Confidence Level: {match_confidence}")
             print(f"\n  Detailed Breakdown:")
+            print(f"    Barcode match:      {'100.0% (exact)' if barcode_matched else '0.0% (no match)'}")
             print(f"    Brand similarity:   {match_details['brand_score']:.1f}%")
             print(f"    Product similarity: {match_details['product_score']:.1f}%")
             print(f"    Keyword similarity: {match_details['keyword_score']:.1f}%")
@@ -324,7 +362,9 @@ class SmartMatcher:
             'confidence': match_confidence,
             'score': match_score,
             'accuracy': accuracy_percentage,
-            'processing_time': processing_time
+            'processing_time': processing_time,
+            'barcode_matched': barcode_matched,
+            'match_details': match_details
         }
 
     def _enhanced_fuzzy_match(self, ocr_text, barcode, products):
@@ -341,11 +381,9 @@ class SmartMatcher:
             for product in products:
                 if product[6] and product[6] == barcode:
                     print(f"  ✓ Exact barcode match (100% accuracy)")
-                    return product, "HIGH", 200.0, {
-                        'brand_score': 100.0,
-                        'product_score': 100.0,
-                        'keyword_score': 100.0
-                    }
+                    # Compute real OCR scores independently so display is honest
+                    ocr_details = self._get_ocr_scores(ocr_lower, product)
+                    return product, "HIGH", 200.0, ocr_details
 
         # Strategy 2: Enhanced fuzzy text matching
         best_match = None
@@ -369,7 +407,7 @@ class SmartMatcher:
                 )
                 details['brand_score'] = brand_score
                 if brand_score >= self.min_brand_score:
-                    total_score += brand_score * 2.5
+                    total_score += brand_score * 0.4
 
             # Product name matching
             product_score = max(
@@ -378,7 +416,7 @@ class SmartMatcher:
             )
             details['product_score'] = product_score
             if product_score >= self.min_product_score:
-                total_score += product_score * 2.0
+                total_score += product_score * 0.5
 
             # Keyword matching
             if keywords:
@@ -394,7 +432,7 @@ class SmartMatcher:
                 details['keyword_score'] = final_keyword_score
 
                 if final_keyword_score >= self.min_keyword_score:
-                    total_score += final_keyword_score * 1.5
+                    total_score += final_keyword_score * 0.1
 
             if total_score > best_score:
                 best_score = total_score
@@ -402,11 +440,11 @@ class SmartMatcher:
                 match_details = details
 
         # Confidence based on raw fuzzy score (used internally for filtering)
-        if best_score >= 180:
+        if best_score >= 65:
             confidence = "HIGH"
-        elif best_score >= 160:
+        elif best_score >= 70:
             confidence = "MEDIUM"
-        elif best_score >= 140:
+        elif best_score >= 55:
             confidence = "LOW"
         else:
             confidence = "NO MATCH"
