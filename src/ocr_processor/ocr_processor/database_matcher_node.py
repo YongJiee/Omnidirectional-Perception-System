@@ -109,7 +109,11 @@ class DatabaseMatcherNode(Node):
         if barcode_used:
             self.get_logger().info(f'    Barcode match:      100.0% (exact) [{barcode_used}]')
         elif barcodes:
-            self.get_logger().info(f'    Barcode match:      0.0% (no exact match) {barcodes}')
+            # ── check if this is a conflict rejection ──
+            if reason and 'conflict' in reason:
+                self.get_logger().warn(f'    Barcode match:      CONFLICT — barcodes received: {barcodes}')
+            else:
+                self.get_logger().info(f'    Barcode match:      0.0% (no exact match) {barcodes}')
         else:
             self.get_logger().info(f'    Barcode match:      0.0% (none provided)')
 
@@ -122,13 +126,13 @@ class DatabaseMatcherNode(Node):
             self.get_logger().info(f'    OCR match:          N/A (no OCR text)')
 
     # ---------------------------------------------------------------
-    # Timing log
+    # Timing log — includes scan_mode for full context
     # ---------------------------------------------------------------
-    def log_timing(self, callback_start, overall_start, end_to_end_from_ocr, mode):
+    def log_timing(self, callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode='sorting'):
         matcher_time = time.time() - callback_start
         now = time.time()
         self.get_logger().info('\n=== MATCHER TIMING ===')
-        self.get_logger().info(f'  Mode:               {mode}')
+        self.get_logger().info(f'  Mode:               {mode} [{scan_mode}]')   # FIX 3: includes scan_mode
         self.get_logger().info(f'  Matcher processing: {matcher_time:.3f}s')
         if overall_start:
             full_end_to_end = now - overall_start
@@ -150,8 +154,10 @@ class DatabaseMatcherNode(Node):
         data = json.loads(msg.data)
         ocr_text = data.get('ocr_text', '') or ''
         mode = data.get('mode', '1-camera')
+        scan_mode = data.get('scan_mode', 'sorting')
         cameras_received = data.get('cameras_received', 1)
         per_camera = data.get('per_camera', {})
+        all_barcodes_by_cam = data.get('all_barcodes_by_cam', {})
 
         overall_start = (
             data.get('overall_start') or
@@ -163,18 +169,66 @@ class DatabaseMatcherNode(Node):
         raw_barcode = data.get('barcode')
         barcodes = self.parse_barcodes(raw_barcode)
 
+        # FIX 2: log every callback immediately — before any early returns
         self.get_logger().info(
-            f'Received [{mode}] — '
+            f'Received [{mode}] [{scan_mode}] — '
             f'Cameras: {cameras_received} | '
             f'OCR: "{ocr_text[:40]}" | '
             f'Barcodes: {barcodes}'
         )
 
+        # FIX 1: fetch all_products once at the top — used throughout
+        all_products = self.matcher.db.get_all_products()
+
+        # ---------------------------------------------------------------
+        # INBOUND MODE — cross-camera barcode conflict detection
+        # All cameras must agree on the same product before proceeding
+        # ---------------------------------------------------------------
+        if scan_mode == 'inbound' and all_barcodes_by_cam:
+            cam_matches = {}  # cam_id → (barcode, product_id, product_name)
+
+            for cam_id, cam_barcodes in all_barcodes_by_cam.items():
+                for b in cam_barcodes:
+                    barcode_data = b.get('data', '') if isinstance(b, dict) else str(b)
+                    for p in all_products:
+                        if p[6] and p[6] == barcode_data:
+                            cam_matches[cam_id] = (barcode_data, p[0], p[1])
+
+            unique_products = {v[1] for v in cam_matches.values()}  # unique product IDs
+
+            if len(unique_products) > 1:
+                # Conflict — cameras see different products
+                conflict_barcodes = [v[0] for v in cam_matches.values()]
+                self.get_logger().warn(
+                    f'[INBOUND] Cross-camera barcode CONFLICT: '
+                    f'{[(cam, v[0], v[2]) for cam, v in cam_matches.items()]}'
+                )
+                self.log_results(
+                    matched=False, product=None, accuracy=0.0,
+                    confidence='NO MATCH', verified=False,
+                    barcode_used=None, barcodes=conflict_barcodes,
+                    ocr_text=ocr_text, details={},
+                    reason='inbound conflict — cameras see different products'
+                )
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
+                return
+
+            elif len(unique_products) == 1:
+                # All cameras agree — use the winning barcode for normal flow
+                winning_cam = next(iter(cam_matches))
+                barcodes = [cam_matches[winning_cam][0]]
+                self.get_logger().info(
+                    f'[INBOUND] All cameras agree on product ID {list(unique_products)[0]} '
+                    f'— proceeding with barcode {barcodes[0]}'
+                )
+            else:
+                # No barcode DB matches across any camera — fall through to OCR
+                self.get_logger().info('[INBOUND] No barcode DB matches across cameras — falling through to OCR')
+
         # ---------------------------------------------------------------
         # Reject if multiple brands detected in OCR text
         # Applies to both inbound and sorting — mixed products = error
         # ---------------------------------------------------------------
-        all_products = self.matcher.db.get_all_products()
         brands_found = list({
             p[2] for p in all_products
             if p[2] and fuzz.partial_ratio(p[2].lower(), ocr_text.lower()) >= 85
@@ -191,7 +245,7 @@ class DatabaseMatcherNode(Node):
                 ocr_text=ocr_text, details={},
                 reason='multiple products detected in frame'
             )
-            self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+            self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
             return
 
         # ---------------------------------------------------------------
@@ -217,7 +271,7 @@ class DatabaseMatcherNode(Node):
                     ocr_text=ocr_text, details={},
                     reason='multiple barcodes matched different products'
                 )
-                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
                 return
 
         if per_camera:
@@ -235,7 +289,7 @@ class DatabaseMatcherNode(Node):
                 verified=False, barcode_used=None, barcodes=barcodes,
                 ocr_text=ocr_text, details={}, reason='insufficient OCR data'
             )
-            self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+            self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
             return
 
         # Tie check if OCR-only (no barcode provided at all)
@@ -249,7 +303,7 @@ class DatabaseMatcherNode(Node):
                     ocr_text=ocr_text, details=details,
                     reason='TIE DETECTED, barcode needed'
                 )
-                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
                 return
 
         # Try each barcode until one exactly matches in DB
@@ -276,7 +330,7 @@ class DatabaseMatcherNode(Node):
                     ocr_text=ocr_text, details=details,
                     reason='TIE DETECTED, barcode needed'
                 )
-                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
                 return
             result = self.matcher.match_and_save(ocr_text=ocr_text, barcode=None)
 
@@ -290,7 +344,7 @@ class DatabaseMatcherNode(Node):
                     ocr_text=ocr_text, details=details,
                     reason='TIE DETECTED, barcode needed'
                 )
-                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+                self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
                 return
 
         # ---------------------------------------------------------------
@@ -329,7 +383,7 @@ class DatabaseMatcherNode(Node):
                 ocr_text=ocr_text, details=details, reason='no product matched'
             )
 
-        self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode)
+        self.log_timing(callback_start, overall_start, end_to_end_from_ocr, mode, scan_mode)
 
 
 def main(args=None):

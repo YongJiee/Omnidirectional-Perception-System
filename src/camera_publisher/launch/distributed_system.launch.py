@@ -16,12 +16,14 @@ def generate_launch_description():
     #              'false' = use real Pi cameras (default)
     # image_dir:   folder containing camera_0.jpg ... camera_N.jpg
     #              (only used when test_mode:=true)
+    # scan_mode:   'inbound'  = collect all faces then match once
+    #              'sorting'  = match as fast as possible (default)
     #
     # Usage examples:
-    #   Real Pi:   ros2 launch ocr_processor launch.py
-    #   Test mode: ros2 launch ocr_processor launch.py test_mode:=true
-    #   2 cameras: ros2 launch ocr_processor launch.py num_cameras:=2 test_mode:=true
-    #   Custom dir: ros2 launch ocr_processor launch.py test_mode:=true image_dir:=/home/user/imgs
+    #   Real Pi (sorting):  ros2 launch camera_publisher distributed_system.launch.py num_cameras:=2
+    #   Real Pi (inbound):  ros2 launch camera_publisher distributed_system.launch.py num_cameras:=2 scan_mode:=inbound
+    #   Test mode:          ros2 launch camera_publisher distributed_system.launch.py test_mode:=true scan_mode:=inbound
+    #   Custom dir:         ros2 launch camera_publisher distributed_system.launch.py test_mode:=true image_dir:=/home/user/imgs
     # ---------------------------------------------------------------
     num_cameras_arg = DeclareLaunchArgument(
         'num_cameras',
@@ -38,15 +40,22 @@ def generate_launch_description():
         default_value='~/test_images',
         description='Folder containing camera_0.jpg ... camera_N.jpg (test mode only)'
     )
+    scan_mode_arg = DeclareLaunchArgument(
+        'scan_mode',
+        default_value='sorting',
+        description='inbound = collect all faces then match once | sorting = match as fast as possible'
+    )
 
     num_cameras = LaunchConfiguration('num_cameras')
     test_mode = LaunchConfiguration('test_mode')
     image_dir = LaunchConfiguration('image_dir')
+    scan_mode = LaunchConfiguration('scan_mode')
 
     return LaunchDescription([
         num_cameras_arg,
         test_mode_arg,
         image_dir_arg,
+        scan_mode_arg,          # FIX: was declared but never added here
 
         # Step 1 — Start database matcher node first
         Node(
@@ -54,6 +63,9 @@ def generate_launch_description():
             executable='database_matcher_node',
             name='database_matcher',
             output='screen',
+            parameters=[
+                {'scan_mode': scan_mode},
+            ],
         ),
 
         # Step 2 — Start OCR node with num_cameras parameter
@@ -65,7 +77,10 @@ def generate_launch_description():
                     executable='ocr_node',
                     name='ocr_node',
                     output='screen',
-                    parameters=[{'num_cameras': num_cameras}],
+                    parameters=[
+                        {'num_cameras': num_cameras},
+                        {'scan_mode': scan_mode},
+                    ],
                 ),
             ]
         ),

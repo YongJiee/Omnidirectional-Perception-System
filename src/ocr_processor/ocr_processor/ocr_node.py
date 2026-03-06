@@ -29,7 +29,11 @@ class OCRProcessor(Node):
         # ---------------------------------------------------------------
         self.declare_parameter('num_cameras', 1)
         self.num_cameras = self.get_parameter('num_cameras').get_parameter_value().integer_value
-        self.get_logger().info(f'Mode: {self.num_cameras}-camera')
+        self.get_logger().info(f'Camera count: {self.num_cameras}-camera')  # FIX 1: distinct label
+
+        self.declare_parameter('scan_mode', 'sorting')
+        self.scan_mode = self.get_parameter('scan_mode').get_parameter_value().string_value
+        self.get_logger().info(f'Scan mode: {self.scan_mode}')              # FIX 1: distinct label
 
         # Buffer to collect results from all cameras before fusing
         self.camera_results = {}
@@ -81,6 +85,7 @@ class OCRProcessor(Node):
             if camera_id in self.camera_results:
                 self.get_logger().warn(f'Camera {camera_id} already processed, skipping duplicate')
                 return
+            self.batch_already_processed = False  # reset when new batch starts
 
         self.get_logger().info(f'Image received from camera {camera_id}')
 
@@ -134,7 +139,8 @@ class OCRProcessor(Node):
     # ---------------------------------------------------------------
     def on_batch_complete(self, msg):
         if self.batch_already_processed:
-            self.batch_already_processed = False
+            self.get_logger().info('Batch already processed — ignoring duplicate signal')
+            # DO NOT reset here — let fuse_and_publish() reset it
             return
 
         self.get_logger().info('Batch complete signal received from Pi')
@@ -148,7 +154,7 @@ class OCRProcessor(Node):
 
         # Poll until all cameras are processed or timeout reached
         # This avoids racing against OCR threads still running
-        timeout = 3.0   # max seconds to wait for all cameras
+        timeout = max(4.0, self.num_cameras * 2.0)   # max seconds to wait for all cameras
         interval = 0.1  # poll every 100ms
         elapsed = 0.0
 
@@ -181,6 +187,9 @@ class OCRProcessor(Node):
             return
 
         if received == 0:
+            if self.batch_already_processed:
+                self.get_logger().info('Batch complete timeout: already processed by fuse — ignoring')
+                return
             self.get_logger().error('No images received — check Pi publisher')
             return
 
@@ -222,7 +231,7 @@ class OCRProcessor(Node):
 
     # ---------------------------------------------------------------
     # Perspective correction
-    # SKEW: left=0.15, right=0.25 (right face is steeper angle)
+    # SKEW: left=0.20, right=0.25 (right face is steeper angle)
     # ---------------------------------------------------------------
     def correct_perspective(self, face_img, is_left_face=True):
         h, w = face_img.shape[:2]
@@ -525,12 +534,11 @@ class OCRProcessor(Node):
             if result['ocr_text']:
                 all_ocr_parts.append(result['ocr_text'])
 
-        fused_barcode = None
+        # Collect ALL barcodes per camera — matcher uses these for conflict detection
+        all_barcodes_by_cam = {}
         for cam_id, result in results_snapshot.items():
             if result['barcodes']:
-                fused_barcode = self.best_barcode(result['barcodes'])
-                self.get_logger().info(f'Best code from camera {cam_id}: {fused_barcode}')
-                break
+                all_barcodes_by_cam[cam_id] = result['barcodes']
 
         fused_ocr = ' '.join(all_ocr_parts) if all_ocr_parts else None
         fuse_time = time.time() - fuse_start
@@ -543,10 +551,24 @@ class OCRProcessor(Node):
                 'barcodes': result['barcodes'],
             }
 
+        # sorting: pick best single barcode for fast path
+        # inbound: send None — matcher will use all_barcodes_by_cam for conflict check
+        fused_barcode = None
+        if self.scan_mode == 'sorting' and all_barcodes_by_cam:
+            for cam_id, barcodes in all_barcodes_by_cam.items():
+                fused_barcode = self.best_barcode(barcodes)
+                if fused_barcode:
+                    self.get_logger().info(
+                        f'  Best code (sorting):    {fused_barcode} from cam {cam_id}'
+                    )
+                    break
+
         self.get_logger().info('=== FUSED RESULT ===')
-        self.get_logger().info(f'  Mode:                   {self.num_cameras}-camera')
+        self.get_logger().info(f'  Scan mode:              {self.scan_mode}')           # FIX 2
+        self.get_logger().info(f'  Camera count:           {self.num_cameras}-camera')
         self.get_logger().info(f'  OCR Text (all cameras): {fused_ocr}')
         self.get_logger().info(f'  Best code:              {fused_barcode}')
+        self.get_logger().info(f'  Barcodes by camera:     {all_barcodes_by_cam}')      # FIX 2
         self.get_logger().info(f'  Cameras with OCR:       {len(all_ocr_parts)}/{len(results_snapshot)}')
         self.get_logger().info(f'  Fuse time:              {fuse_time:.3f}s')
         if end_to_end:
@@ -555,7 +577,11 @@ class OCRProcessor(Node):
 
         result_msg = json.dumps({
             'ocr_text': fused_ocr,
-            'barcode': fused_barcode,
+            'barcode': fused_barcode,               # sorting: best single | inbound: None
+            'all_barcodes_by_cam': {                # inbound: ALL barcodes for conflict check
+                str(k): v for k, v in all_barcodes_by_cam.items()
+            },
+            'scan_mode': self.scan_mode,            # tells matcher which logic to use
             'mode': f'{self.num_cameras}-camera',
             'cameras_received': len(results_snapshot),
             'per_camera': per_camera_summary,
@@ -640,8 +666,16 @@ class OCRProcessor(Node):
 
         return ' '.join(best_result)
 
+    # Short noise words Tesseract commonly misreads from edges/tape
+    OCR_NOISE_WORDS = {'ill', 'lll', 'lil', 'llI', 'III', 'iil', 'lli'}
+
     def filter_barcode_text(self, text):
+        # Remove barcode-format strings
         text = re.sub(r'\b[A-Za-z]+-[A-Za-z]+-\d+\b', '', text)
+        # Remove known noise words
+        words = text.split()
+        words = [w for w in words if w not in self.OCR_NOISE_WORDS]
+        text = ' '.join(words)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
