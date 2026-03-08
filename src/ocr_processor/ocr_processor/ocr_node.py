@@ -20,22 +20,51 @@ RELIABLE_QOS = QoSProfile(
     depth=10
 )
 
+# ---------------------------------------------------------------
+# Quantity extraction — raw OCR pass only.
+# ocr_node does NOT decide flagging — that is handled in
+# database_matcher_node using resolve_quantity(ocr_text, scan_mode).
+# ocr_node only reports whether a qty pattern was found or not.
+# ---------------------------------------------------------------
+QTY_PATTERNS = [
+    r'[Qq]uantity[\s:]*(\d+)',
+    r'[Qq]\'?ty[\s:\.]*(\d+)',
+    r'\bCTN\s+OF\s+(\d+)\b',
+    r'\b(\d+)\s*[Pp][Cc][Ss]\b',
+    r'\b[Xx]\s*(\d+)\b',
+    r'\b(\d+)\s*[Uu][Nn][Ii][Tt][Ss]?\b',
+]
+
+def extract_quantity_raw(ocr_text):
+    """
+    Raw quantity extraction — returns (qty, 'ocr') if found, else (None, None).
+    Does NOT apply inbound/sorting fallback rules — that is done in matcher node.
+    """
+    if not ocr_text:
+        return None, None
+    for pattern in QTY_PATTERNS:
+        match = re.search(pattern, ocr_text)
+        if match:
+            qty = int(match.group(1))
+            if 1 <= qty <= 9999:
+                return qty, 'ocr'
+    return None, None
+
 
 class OCRProcessor(Node):
     def __init__(self):
         super().__init__('ocr_node')
         # ---------------------------------------------------------------
-        # Mode selection — default 1 (single), set 4 for multi-camera
+        # Mode selection
         # ---------------------------------------------------------------
         self.declare_parameter('num_cameras', 1)
         self.num_cameras = self.get_parameter('num_cameras').get_parameter_value().integer_value
-        self.get_logger().info(f'Camera count: {self.num_cameras}-camera')  # FIX 1: distinct label
+        self.get_logger().info(f'Camera count: {self.num_cameras}-camera')
 
         self.declare_parameter('scan_mode', 'sorting')
         self.scan_mode = self.get_parameter('scan_mode').get_parameter_value().string_value
-        self.get_logger().info(f'Scan mode: {self.scan_mode}')              # FIX 1: distinct label
+        self.get_logger().info(f'Scan mode: {self.scan_mode}')
 
-        # Buffer to collect results from all cameras before fusing
         self.camera_results = {}
         self.camera_results_lock = threading.Lock()
         self.overall_start = None
@@ -43,12 +72,8 @@ class OCRProcessor(Node):
         self.batch_already_processed = False
         self._fuse_triggered = False
 
-        # Publisher
         self.result_publisher = self.create_publisher(String, '/ocr_results', 10)
 
-        # ---------------------------------------------------------------
-        # Subscribe to correct topics based on mode
-        # ---------------------------------------------------------------
         self.subscriptions_ = []
         if self.num_cameras == 1:
             sub = self.create_subscription(
@@ -76,16 +101,12 @@ class OCRProcessor(Node):
 
         self.get_logger().info(f'OCR Processor ready — waiting for {self.num_cameras} image(s)...')
 
-    # ---------------------------------------------------------------
-    # Called when each camera image arrives — spawns background thread
-    # so multiple cameras process IN PARALLEL
-    # ---------------------------------------------------------------
     def on_image_received(self, msg, camera_id):
         with self.camera_results_lock:
             if camera_id in self.camera_results:
                 self.get_logger().warn(f'Camera {camera_id} already processed, skipping duplicate')
                 return
-            self.batch_already_processed = False  # reset when new batch starts
+            self.batch_already_processed = False
 
         self.get_logger().info(f'Image received from camera {camera_id}')
 
@@ -106,9 +127,6 @@ class OCRProcessor(Node):
         )
         thread.start()
 
-    # ---------------------------------------------------------------
-    # Background worker — runs process_single_image per camera
-    # ---------------------------------------------------------------
     def _process_and_collect(self, msg, camera_id, cam_start):
         result = self.process_single_image(msg, camera_id, cam_start)
 
@@ -133,14 +151,9 @@ class OCRProcessor(Node):
                 self.get_logger().info('All camera images received — fusing now')
             self.fuse_and_publish()
 
-    # ---------------------------------------------------------------
-    # Called when Pi signals all cameras done (multi-camera only)
-    # Fallback fuse in case not all images arrived via _process_and_collect
-    # ---------------------------------------------------------------
     def on_batch_complete(self, msg):
         if self.batch_already_processed:
             self.get_logger().info('Batch already processed — ignoring duplicate signal')
-            # DO NOT reset here — let fuse_and_publish() reset it
             return
 
         self.get_logger().info('Batch complete signal received from Pi')
@@ -152,31 +165,23 @@ class OCRProcessor(Node):
         except Exception:
             pass
 
-        # Poll until all cameras are processed or timeout reached
-        # This avoids racing against OCR threads still running
-        timeout = max(4.0, self.num_cameras * 2.0)   # max seconds to wait for all cameras
-        interval = 0.1  # poll every 100ms
+        timeout = max(4.0, self.num_cameras * 2.0)
+        interval = 0.1
         elapsed = 0.0
 
         while elapsed < timeout:
             with self.camera_results_lock:
                 received = len(self.camera_results)
                 already_fused = self._fuse_triggered
-
             if already_fused:
-                # _process_and_collect already handled all cameras — do nothing
                 self.get_logger().info('Batch complete: already fused by process threads')
                 return
-
             if received == self.num_cameras:
-                # All cameras done — fuse will be triggered by _process_and_collect
                 self.get_logger().info(f'Batch complete: all {self.num_cameras} cameras received')
                 return
-
             time.sleep(interval)
             elapsed += interval
 
-        # Timeout reached — fuse whatever we have
         with self.camera_results_lock:
             received = len(self.camera_results)
             already_fused = self._fuse_triggered
@@ -185,14 +190,11 @@ class OCRProcessor(Node):
 
         if already_fused:
             return
-
         if received == 0:
             if self.batch_already_processed:
-                self.get_logger().info('Batch complete timeout: already processed by fuse — ignoring')
                 return
             self.get_logger().error('No images received — check Pi publisher')
             return
-
         if received < self.num_cameras:
             self.get_logger().warn(
                 f'Only {received}/{self.num_cameras} cameras received after timeout — fusing partial'
@@ -208,75 +210,45 @@ class OCRProcessor(Node):
         if do_fuse:
             self.fuse_and_publish()
 
-    # ---------------------------------------------------------------
-    # Detect box corner to split left/right faces
-    # ---------------------------------------------------------------
     def find_split_column(self, gray):
         edges = cv2.Canny(gray, 50, 150)
         col_sums = np.sum(edges, axis=0)
-
         width = gray.shape[1]
         search_start = width // 3
         search_end = 2 * width // 3
         mid_region = col_sums[search_start:search_end]
-
         split_col = search_start + int(np.argmax(mid_region))
-
         if split_col < width * 0.25 or split_col > width * 0.75:
             self.get_logger().warn('Split detection uncertain — using center split')
             split_col = width // 2
-
         self.get_logger().info(f'Detected split column: {split_col} / {width}')
         return split_col
 
-    # ---------------------------------------------------------------
-    # Perspective correction
-    # SKEW: left=0.20, right=0.25 (right face is steeper angle)
-    # ---------------------------------------------------------------
     def correct_perspective(self, face_img, is_left_face=True):
         h, w = face_img.shape[:2]
         SKEW = 0.20 if is_left_face else 0.25
-
         src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-
         if is_left_face:
             dst = np.float32([
-                [w * SKEW, 0],
-                [w,        0],
-                [w,        h],
-                [w * SKEW, h]
+                [w * SKEW, 0], [w, 0], [w, h], [w * SKEW, h]
             ])
         else:
             dst = np.float32([
-                [0,              0],
-                [w * (1 - SKEW), 0],
-                [w * (1 - SKEW), h],
-                [0,              h]
+                [0, 0], [w * (1 - SKEW), 0], [w * (1 - SKEW), h], [0, h]
             ])
-
         M = cv2.getPerspectiveTransform(src, dst)
         corrected = cv2.warpPerspective(face_img, M, (w, h))
-
         if is_left_face:
             corrected = corrected[:, int(w * SKEW):]
         else:
             corrected = corrected[:, :int(w * (1 - SKEW))]
-
         return corrected
 
-    # ---------------------------------------------------------------
-    # Detect ALL code types on an image
-    # Pass 1 — pyzbar on original + Otsu  → linear barcodes
-    # Pass 2 — QR crop 2x upscale         → corrected face QR
-    # Pass 3 — raw face 3x fallback        → raw face QR fallback
-    # ---------------------------------------------------------------
     def detect_codes(self, img, label='', raw_img=None):
         results = []
         seen_data = set()
-
         gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Pass 1
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         for test_img in [gray, otsu]:
             for b in pyzbar.decode(test_img):
@@ -286,7 +258,6 @@ class OCRProcessor(Node):
                     seen_data.add(data)
                     self.get_logger().info(f'  [{label}] pyzbar: {b.type} = {data}')
 
-        # Pass 2: QR crop 2x
         if not any(r['type'] == 'QRCODE' for r in results):
             h, w = gray.shape
             qr_crop = gray[int(h * 0.3):, :int(w * 0.8)]
@@ -299,7 +270,6 @@ class OCRProcessor(Node):
                     seen_data.add(data)
                     self.get_logger().info(f'  [{label}] pyzbar QR-crop 2x: {b.type} = {data}')
 
-        # Pass 3: raw face 3x fallback
         if not any(r['type'] == 'QRCODE' for r in results) and raw_img is not None:
             raw_gray = raw_img if len(raw_img.shape) == 2 else cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
             large_raw = cv2.resize(raw_gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
@@ -317,45 +287,31 @@ class OCRProcessor(Node):
                 cleaned.append(r)
             elif re.match(r'^[A-Za-z0-9\-]+$', r['data']):
                 cleaned.append(r)
-
         return cleaned
 
-    # ---------------------------------------------------------------
-    # Select best barcode — prefer alphanumeric + dash
-    # ---------------------------------------------------------------
     def best_barcode(self, barcodes):
         for b in barcodes:
             if re.match(r'^[A-Za-z0-9\-]+$', b['data']):
                 return b
         return barcodes[0] if barcodes else None
 
-    # ---------------------------------------------------------------
-    # Process a single face — codes + OCR
-    # Extracted so it can be called in parallel via ThreadPoolExecutor
-    # ---------------------------------------------------------------
     def process_face(self, camera_id, face_label, full_corrected, raw_face,
                      is_left, ocr_region, global_barcodes, global_qr):
 
-        # Code detection
         code_start = time.time()
         if is_left:
             qr_codes = [c for c in self.detect_codes(
-                full_corrected,
-                label=f'cam{camera_id}-{face_label}',
-                raw_img=raw_face
+                full_corrected, label=f'cam{camera_id}-{face_label}', raw_img=raw_face
             ) if c['type'] == 'QRCODE']
             barcode_results = global_barcodes + qr_codes
         else:
             per_face = self.detect_codes(
-                full_corrected,
-                label=f'cam{camera_id}-{face_label}',
-                raw_img=raw_face
+                full_corrected, label=f'cam{camera_id}-{face_label}', raw_img=raw_face
             )
             per_face_data = {r['data'] for r in per_face}
             barcode_results = per_face + [q for q in global_qr if q['data'] not in per_face_data]
         code_time = time.time() - code_start
 
-        # OCR — PSM 11 first, fallback to PSM 6, then PSM 3 only if zero words
         ocr_start = time.time()
         clean_text = self.extract_clean_text(ocr_region, psm=11, min_conf=40)
 
@@ -365,7 +321,6 @@ class OCRProcessor(Node):
                 clean_text = clean_text_psm6
                 self.get_logger().info(f'Cam {camera_id} {face_label}: PSM 6 improved OCR')
 
-        # PSM 3 only if still completely empty
         if not clean_text:
             clean_text_psm3 = self.extract_clean_text(ocr_region, psm=3, min_conf=35)
             if clean_text_psm3:
@@ -386,20 +341,11 @@ class OCRProcessor(Node):
             f'{clean_text if clean_text else "None"} ({ocr_time:.3f}s)'
         )
 
-        return {
-            'face': face_label,
-            'ocr_text': clean_text,
-            'barcodes': barcode_results,
-        }
+        return {'face': face_label, 'ocr_text': clean_text, 'barcodes': barcode_results}
 
-    # ---------------------------------------------------------------
-    # Process a single camera image
-    # Left + right faces processed IN PARALLEL via ThreadPoolExecutor
-    # ---------------------------------------------------------------
     def process_single_image(self, msg, camera_id, cam_start):
         processing_start = time.time()
 
-        # Decode
         decode_start = time.time()
         np_arr = np.frombuffer(msg.data, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -407,71 +353,52 @@ class OCRProcessor(Node):
 
         cv2.imwrite(f'/tmp/camera_{camera_id}_received.jpg', frame)
 
-        # Grayscale + downscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape
         if width > 1280:
             scale = 1280 / width
             gray = cv2.resize(gray, None, fx=scale, fy=scale)
-            width  = gray.shape[1]
+            width = gray.shape[1]
             height = gray.shape[0]
 
-        # Split into left/right faces with 5% overlap
         split_start = time.time()
         split_col = self.find_split_column(gray)
-        overlap    = int(width * 0.05)
-        left_face  = gray[:, :split_col + overlap]
+        overlap = int(width * 0.05)
+        left_face = gray[:, :split_col + overlap]
         right_face = gray[:, split_col:]
         split_time = time.time() - split_start
 
-        # Perspective correction
-        left_corrected  = self.correct_perspective(left_face,  is_left_face=True)
+        left_corrected = self.correct_perspective(left_face, is_left_face=True)
         right_corrected = self.correct_perspective(right_face, is_left_face=False)
 
-        # OCR regions
-        left_h,  left_w  = left_corrected.shape[:2]
+        left_h, left_w = left_corrected.shape[:2]
         right_h, right_w = right_corrected.shape[:2]
-        left_ocr_region  = left_corrected[:int(left_h  * 0.70), :]
+        left_ocr_region = left_corrected[:int(left_h * 0.70), :]
         right_ocr_region = right_corrected[:int(right_h * 0.45), :int(right_w * 0.75)]
 
-        # Save debug images
-        cv2.imwrite(f'/tmp/camera_{camera_id}_face_left_corrected.jpg',  left_corrected)
+        cv2.imwrite(f'/tmp/camera_{camera_id}_face_left_corrected.jpg', left_corrected)
         cv2.imwrite(f'/tmp/camera_{camera_id}_face_right_corrected.jpg', right_corrected)
-        cv2.imwrite(f'/tmp/camera_{camera_id}_face_left_ocr.jpg',        left_ocr_region)
-        cv2.imwrite(f'/tmp/camera_{camera_id}_face_right_ocr.jpg',       right_ocr_region)
+        cv2.imwrite(f'/tmp/camera_{camera_id}_face_left_ocr.jpg', left_ocr_region)
+        cv2.imwrite(f'/tmp/camera_{camera_id}_face_right_ocr.jpg', right_ocr_region)
 
-        # Global barcode scan BEFORE warping — warp distorts barcodes
-        global_codes    = self.detect_codes(gray, label=f'cam{camera_id}-full')
+        global_codes = self.detect_codes(gray, label=f'cam{camera_id}-full')
         global_barcodes = [c for c in global_codes if c['type'] != 'QRCODE']
-        global_qr       = [c for c in global_codes if c['type'] == 'QRCODE']
+        global_qr = [c for c in global_codes if c['type'] == 'QRCODE']
         self.get_logger().info(f'Global barcode scan: {global_barcodes if global_barcodes else "None"}')
         self.get_logger().info(f'Global QR scan: {global_qr if global_qr else "None"}')
 
-        # ---------------------------------------------------------------
-        # Process LEFT and RIGHT faces IN PARALLEL
-        # Saves ~0.4-0.5s per camera vs sequential face processing
-        # ---------------------------------------------------------------
         proc_start = time.time()
-
         face_configs = [
-            ('left',  left_corrected,  left_face,  True,  left_ocr_region),
+            ('left', left_corrected, left_face, True, left_ocr_region),
             ('right', right_corrected, right_face, False, right_ocr_region),
         ]
-
         face_results = [None, None]
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_idx = {
                 executor.submit(
-                    self.process_face,
-                    camera_id,
-                    face_label,
-                    full_corrected,
-                    raw_face,
-                    is_left,
-                    ocr_region,
-                    global_barcodes,
-                    global_qr
+                    self.process_face, camera_id, face_label, full_corrected,
+                    raw_face, is_left, ocr_region, global_barcodes, global_qr
                 ): idx
                 for idx, (face_label, full_corrected, raw_face, is_left, ocr_region)
                 in enumerate(face_configs)
@@ -483,19 +410,14 @@ class OCRProcessor(Node):
                 except Exception as e:
                     face_label = face_configs[idx][0]
                     self.get_logger().error(f'Face {face_label} processing error: {str(e)}')
-                    face_results[idx] = {
-                        'face': face_configs[idx][0],
-                        'ocr_text': None,
-                        'barcodes': [],
-                    }
+                    face_results[idx] = {'face': face_configs[idx][0], 'ocr_text': None, 'barcodes': []}
 
         proc_time = time.time() - proc_start
         processing_time = time.time() - processing_start
 
-        # Merge results (left first, then right)
         all_ocr_parts = [f['ocr_text'] for f in face_results if f and f['ocr_text']]
-        all_barcodes  = [b for f in face_results if f for b in f['barcodes']]
-        merged_ocr    = ' '.join(all_ocr_parts) if all_ocr_parts else None
+        all_barcodes = [b for f in face_results if f for b in f['barcodes']]
+        merged_ocr = ' '.join(all_ocr_parts) if all_ocr_parts else None
 
         self.get_logger().info(f'=== CAMERA {camera_id} OCR RESULTS (2-face + perspective) ===')
         self.get_logger().info(f'  Split col:  {split_col}px  overlap={overlap}px  ({split_time:.3f}s)')
@@ -521,7 +443,9 @@ class OCRProcessor(Node):
         }
 
     # ---------------------------------------------------------------
-    # Fuse results from all cameras and publish
+    # Fuse results from all cameras and publish.
+    # Quantity is extracted raw here — inbound/sorting flagging rules
+    # are applied in database_matcher_node via resolve_quantity().
     # ---------------------------------------------------------------
     def fuse_and_publish(self):
         fuse_start = time.time()
@@ -534,7 +458,6 @@ class OCRProcessor(Node):
             if result['ocr_text']:
                 all_ocr_parts.append(result['ocr_text'])
 
-        # Collect ALL barcodes per camera — matcher uses these for conflict detection
         all_barcodes_by_cam = {}
         for cam_id, result in results_snapshot.items():
             if result['barcodes']:
@@ -544,6 +467,16 @@ class OCRProcessor(Node):
         fuse_time = time.time() - fuse_start
         end_to_end = time.time() - self.overall_start if self.overall_start else None
 
+        # ── Raw quantity extraction — no stage rules applied here ──
+        qty_raw, qty_source_raw = extract_quantity_raw(fused_ocr or '')
+        if qty_raw:
+            self.get_logger().info(f'  Quantity (raw):         {qty_raw} (source: ocr)')
+        else:
+            self.get_logger().info(
+                f'  Quantity (raw):         not found — '
+                f'matcher will apply {"flagged" if self.scan_mode == "inbound" else "default=1"} rule'
+            )
+
         per_camera_summary = {}
         for cam_id, result in results_snapshot.items():
             per_camera_summary[cam_id] = {
@@ -551,8 +484,6 @@ class OCRProcessor(Node):
                 'barcodes': result['barcodes'],
             }
 
-        # sorting: pick best single barcode for fast path
-        # inbound: send None — matcher will use all_barcodes_by_cam for conflict check
         fused_barcode = None
         if self.scan_mode == 'sorting' and all_barcodes_by_cam:
             for cam_id, barcodes in all_barcodes_by_cam.items():
@@ -564,11 +495,11 @@ class OCRProcessor(Node):
                     break
 
         self.get_logger().info('=== FUSED RESULT ===')
-        self.get_logger().info(f'  Scan mode:              {self.scan_mode}')           # FIX 2
+        self.get_logger().info(f'  Scan mode:              {self.scan_mode}')
         self.get_logger().info(f'  Camera count:           {self.num_cameras}-camera')
         self.get_logger().info(f'  OCR Text (all cameras): {fused_ocr}')
         self.get_logger().info(f'  Best code:              {fused_barcode}')
-        self.get_logger().info(f'  Barcodes by camera:     {all_barcodes_by_cam}')      # FIX 2
+        self.get_logger().info(f'  Barcodes by camera:     {all_barcodes_by_cam}')
         self.get_logger().info(f'  Cameras with OCR:       {len(all_ocr_parts)}/{len(results_snapshot)}')
         self.get_logger().info(f'  Fuse time:              {fuse_time:.3f}s')
         if end_to_end:
@@ -577,22 +508,21 @@ class OCRProcessor(Node):
 
         result_msg = json.dumps({
             'ocr_text': fused_ocr,
-            'barcode': fused_barcode,               # sorting: best single | inbound: None
-            'all_barcodes_by_cam': {                # inbound: ALL barcodes for conflict check
-                str(k): v for k, v in all_barcodes_by_cam.items()
-            },
-            'scan_mode': self.scan_mode,            # tells matcher which logic to use
+            'barcode': fused_barcode,
+            'all_barcodes_by_cam': {str(k): v for k, v in all_barcodes_by_cam.items()},
+            'scan_mode': self.scan_mode,
             'mode': f'{self.num_cameras}-camera',
             'cameras_received': len(results_snapshot),
             'per_camera': per_camera_summary,
             'overall_start': self.overall_start,
             'end_to_end_time': end_to_end,
-            'save_dir': self.batch_save_dir
+            'save_dir': self.batch_save_dir,
+            'quantity_raw': qty_raw,           # raw OCR value, may be None
+            'quantity_source_raw': qty_source_raw  # 'ocr' or None
         })
         self.result_publisher.publish(String(data=result_msg))
         self.get_logger().info('Fused result published to /ocr_results')
 
-        # Reset for next batch
         with self.camera_results_lock:
             self.batch_already_processed = True
             self.camera_results = {}
@@ -604,45 +534,20 @@ class OCRProcessor(Node):
     # Helpers
     # ---------------------------------------------------------------
     OCR_CORRECTIONS = {
-        # Gloss misreads
-        'Gass':   'Gloss',
-        'Goss':   'Gloss',
-        'Gloss':  'Gloss',
-        'Gross':  'Gloss',
-        # Stain misreads
-        'Stam':   'Stain',
-        'Stal':   'Stain',
-        'Stan':   'Stain',
-        'Stain':  'Stain',
-        # Cream misreads
-        'Crean':  'Cream',
-        'Cram':   'Cream',
-        'Crear':  'Cream',
-        'Crearn': 'Cream',
-        # Lip misreads
-        'Lin':    'Lip',
-        'Lp':     'Lip',
-        'Liq':    'Lip',
-        # SEPHORA misreads — truncation and mixed case
-        'SEPHOR': 'SEPHORA',
-        'SEPHOF': 'SEPHORA',
-        'SEPHO':  'SEPHORA',
-        'sEPHORA':'SEPHORA',
-        'sEPHOR': 'SEPHORA',
-        'Sephora':'SEPHORA',
-        'SEPORA': 'SEPHORA',
-        'SEPHORS':'SEPHORA',
+        'Gass': 'Gloss', 'Goss': 'Gloss', 'Gloss': 'Gloss', 'Gross': 'Gloss',
+        'Stam': 'Stain', 'Stal': 'Stain', 'Stan': 'Stain', 'Stain': 'Stain',
+        'Crean': 'Cream', 'Cram': 'Cream', 'Crear': 'Cream', 'Crearn': 'Cream',
+        'Lin': 'Lip', 'Lp': 'Lip', 'Liq': 'Lip',
+        'SEPHOR': 'SEPHORA', 'SEPHOF': 'SEPHORA', 'SEPHO': 'SEPHORA',
+        'sEPHORA': 'SEPHORA', 'sEPHOR': 'SEPHORA', 'Sephora': 'SEPHORA',
+        'SEPORA': 'SEPHORA', 'SEPHORS': 'SEPHORA',
     }
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
         gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # CLAHE — improves local contrast for Tesseract
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-
         best_result = []
-
         for img_variant in [gray, enhanced]:
             data = pytesseract.image_to_data(
                 img_variant,
@@ -655,24 +560,18 @@ class OCRProcessor(Node):
                 if int(conf) > min_conf and len(word) >= 2:
                     if not re.match(r'^[A-Za-z0-9]+$', word):
                         continue
-                    # Apply correction before length check — fixes short misreads
                     word = self.OCR_CORRECTIONS.get(word, word)
-                    # After correction, enforce minimum 3 chars
                     if len(word) < 3:
                         continue
                     clean.append(word)
             if len(clean) > len(best_result):
                 best_result = clean
-
         return ' '.join(best_result)
 
-    # Short noise words Tesseract commonly misreads from edges/tape
     OCR_NOISE_WORDS = {'ill', 'lll', 'lil', 'llI', 'III', 'iil', 'lli'}
 
     def filter_barcode_text(self, text):
-        # Remove barcode-format strings
         text = re.sub(r'\b[A-Za-z]+-[A-Za-z]+-\d+\b', '', text)
-        # Remove known noise words
         words = text.split()
         words = [w for w in words if w not in self.OCR_NOISE_WORDS]
         text = ' '.join(words)
