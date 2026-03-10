@@ -112,11 +112,11 @@ def generate_launch_description():
                     cmd=[
                         'ssh', pi_host,
                         [
-                            'bash -c "export ROS_DOMAIN_ID=30 && ',
-                            'source /home/team9camera/ros2_humble/install/setup.bash && ',
-                            'cd /home/team9camera/Project4_ws && ',
-                            'source install/setup.bash && ',
-                            'ros2 run camera_publisher multi_camera_node ',
+                            'bash -c "export ROS_DOMAIN_ID=30 && '
+                            'source /home/team9camera/ros2_humble/install/setup.bash && '
+                            'cd /home/team9camera/Project4_ws && '
+                            'source install/setup.bash && '
+                            'ros2 run camera_publisher multi_camera_node '
                             '--ros-args -p num_cameras:=',
                             num_cameras,
                             '"'

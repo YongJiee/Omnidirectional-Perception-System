@@ -164,12 +164,14 @@ class MultiCameraPublisher(Node):
         self.get_logger().info(f'=== Cycle complete: {total:.3f}s ===')
         self.get_logger().info(f'All images saved to: {self.save_dir}')  # ← this was before publish
 
-        time.sleep(1.0)
+        time.sleep(4.0)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MultiCameraPublisher()
+    # Spin briefly to allow any pending callbacks/deliveries to complete
+    rclpy.spin_once(node, timeout_sec=0.0)
     node.destroy_node()
     rclpy.shutdown()
 

@@ -28,11 +28,12 @@ RELIABLE_QOS = QoSProfile(
 # ---------------------------------------------------------------
 QTY_PATTERNS = [
     r'[Qq]uantity[\s:]*(\d+)',
-    r'[Qq]\'?ty[\s:\.]*(\d+)',
+    r'[Qq][Tt][Yy][\s:\.]*(\d+)',
     r'\bCTN\s+OF\s+(\d+)\b',
     r'\b(\d+)\s*[Pp][Cc][Ss]\b',
     r'\b[Xx]\s*(\d+)\b',
     r'\b(\d+)\s*[Uu][Nn][Ii][Tt][Ss]?\b',
+    r'\baty[\s:\.]*(\d+)',
 ]
 
 def extract_quantity_raw(ocr_text):
@@ -165,7 +166,7 @@ class OCRProcessor(Node):
         except Exception:
             pass
 
-        timeout = max(4.0, self.num_cameras * 2.0)
+        timeout = max(3.0, self.num_cameras * 1.0)  # 3s for 3 cameras — Pi cycle ~2.5s
         interval = 0.1
         elapsed = 0.0
 
@@ -226,7 +227,7 @@ class OCRProcessor(Node):
 
     def correct_perspective(self, face_img, is_left_face=True):
         h, w = face_img.shape[:2]
-        SKEW = 0.20 if is_left_face else 0.25
+        SKEW = 0.20 if is_left_face else 0.10
         src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
         if is_left_face:
             dst = np.float32([
@@ -345,6 +346,7 @@ class OCRProcessor(Node):
 
     def process_single_image(self, msg, camera_id, cam_start):
         processing_start = time.time()
+        network_latency = processing_start - cam_start  # time from Pi publish to WSL receive
 
         decode_start = time.time()
         np_arr = np.frombuffer(msg.data, np.uint8)
@@ -373,8 +375,11 @@ class OCRProcessor(Node):
 
         left_h, left_w = left_corrected.shape[:2]
         right_h, right_w = right_corrected.shape[:2]
-        left_ocr_region = left_corrected[:int(left_h * 0.70), :]
-        right_ocr_region = right_corrected[:int(right_h * 0.45), :int(right_w * 0.75)]
+        left_ocr_region = left_corrected[:int(left_h * 0.70), int(left_w * 0.40):]
+        right_ocr_region = right_corrected[:int(right_h * 0.80), :]
+
+        # Full image OCR region — top 65% of full grayscale (for flat-facing cameras)
+        full_ocr_region = gray[:int(height * 0.80), :]
 
         cv2.imwrite(f'/tmp/camera_{camera_id}_face_left_corrected.jpg', left_corrected)
         cv2.imwrite(f'/tmp/camera_{camera_id}_face_right_corrected.jpg', right_corrected)
@@ -394,7 +399,16 @@ class OCRProcessor(Node):
         ]
         face_results = [None, None]
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # ── Run left face, right face, and full image OCR in parallel ──
+        def run_full_ocr(region):
+            text = self.extract_clean_text(region, psm=11, min_conf=40)
+            if not text or len(text.split()) < 2:
+                text = self.extract_clean_text(region, psm=6, min_conf=40)
+            if text:
+                text = self.filter_barcode_text(text)
+            return text
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_idx = {
                 executor.submit(
                     self.process_face, camera_id, face_label, full_corrected,
@@ -403,7 +417,11 @@ class OCRProcessor(Node):
                 for idx, (face_label, full_corrected, raw_face, is_left, ocr_region)
                 in enumerate(face_configs)
             }
-            for future in as_completed(future_to_idx):
+            full_future = executor.submit(run_full_ocr, full_ocr_region)
+
+            for future in as_completed(list(future_to_idx.keys()) + [full_future]):
+                if future is full_future:
+                    continue
                 idx = future_to_idx[future]
                 try:
                     face_results[idx] = future.result()
@@ -412,20 +430,46 @@ class OCRProcessor(Node):
                     self.get_logger().error(f'Face {face_label} processing error: {str(e)}')
                     face_results[idx] = {'face': face_configs[idx][0], 'ocr_text': None, 'barcodes': []}
 
+            try:
+                full_ocr_text = full_future.result()
+            except Exception:
+                full_ocr_text = None
+
         proc_time = time.time() - proc_start
         processing_time = time.time() - processing_start
 
         all_ocr_parts = [f['ocr_text'] for f in face_results if f and f['ocr_text']]
         all_barcodes = [b for f in face_results if f for b in f['barcodes']]
-        merged_ocr = ' '.join(all_ocr_parts) if all_ocr_parts else None
+        face_merged = ' '.join(all_ocr_parts) if all_ocr_parts else None
 
-        self.get_logger().info(f'=== CAMERA {camera_id} OCR RESULTS (2-face + perspective) ===')
+        # Score OCR candidates — prefer the one with more meaningful words
+        # (avoids face split "winning" due to noise tokens like 'IRA', 'MTT')
+        def ocr_score(text):
+            if not text:
+                return 0
+            words = text.split()
+            # Count only words >=3 chars (filters single-char noise and 2-char fragments)
+            meaningful = [w for w in words if len(w) >= 3]
+            return len(meaningful)
+
+        full_score = ocr_score(full_ocr_text)
+        face_score = ocr_score(face_merged)
+
+        if full_ocr_text and full_score >= face_score:
+            merged_ocr = full_ocr_text
+            self.get_logger().info(f'  Full OCR:   {full_ocr_text} ← used (score {full_score} >= face {face_score})')
+        else:
+            merged_ocr = face_merged
+            if full_ocr_text:
+                self.get_logger().info(f'  Full OCR:   {full_ocr_text} (score {full_score} < face {face_score})')
+
+        self.get_logger().info(f'=== CAMERA {camera_id} OCR RESULTS (2-face + full parallel) ===')
         self.get_logger().info(f'  Split col:  {split_col}px  overlap={overlap}px  ({split_time:.3f}s)')
         self.get_logger().info(f'  Codes:      {all_barcodes if all_barcodes else "None"}')
         self.get_logger().info(f'  OCR Text:   {merged_ocr if merged_ocr else "None"}')
         self.get_logger().info(f'  Decode:     {decode_time:.3f}s')
         self.get_logger().info(f'  Split:      {split_time:.3f}s')
-        self.get_logger().info(f'  Processing: {proc_time:.3f}s  ← left+right ran in parallel')
+        self.get_logger().info(f'  Processing: {proc_time:.3f}s  ← left+right+full ran in parallel')
         self.get_logger().info(f'  Total:      {processing_time:.3f}s')
 
         return {
@@ -438,7 +482,9 @@ class OCRProcessor(Node):
                 'decode': decode_time,
                 'split': split_time,
                 'processing': proc_time,
-                'total': processing_time
+                'total': processing_time,
+                'network_latency': network_latency,
+                'cam_start_offset': max(0.0, cam_start - (self.overall_start or cam_start)),
             }
         }
 
@@ -479,9 +525,15 @@ class OCRProcessor(Node):
 
         per_camera_summary = {}
         for cam_id, result in results_snapshot.items():
+            t = result.get('timing', {})
             per_camera_summary[cam_id] = {
                 'ocr_text': result['ocr_text'],
                 'barcodes': result['barcodes'],
+                'timing': {
+                    'total': t.get('total', 0.0),
+                    'network_latency': t.get('network_latency', 0.0),
+                    'cam_start_offset': t.get('cam_start_offset', 0.0),
+                }
             }
 
         fused_barcode = None
@@ -505,6 +557,40 @@ class OCRProcessor(Node):
         if end_to_end:
             self.get_logger().info(f'  END-TO-END TIME:        {end_to_end:.3f}s')
         self.get_logger().info('====================')
+
+        # ── Pipeline timing breakdown ─────────────────────────────────
+        self.get_logger().info('')
+        self.get_logger().info('=== PIPELINE TIMING BREAKDOWN ===')
+        self.get_logger().info('  [Pi -- multi_camera_publisher]  (capture timing: see Pi log)')
+        for cam_id in sorted(results_snapshot.keys()):
+            t = results_snapshot[cam_id].get('timing', {})
+            offset = t.get('cam_start_offset', 0.0)
+            net = t.get('network_latency', 0.0)
+            self.get_logger().info(
+                f'    Cam {cam_id}: published at +{offset:.3f}s  '
+                f'| network delay to WSL: {net:.3f}s'
+            )
+        self.get_logger().info('')
+        self.get_logger().info('  [WSL -- ocr_node  (cameras processed in parallel)]')
+        slowest_ocr = 0.0
+        for cam_id in sorted(results_snapshot.keys()):
+            t = results_snapshot[cam_id].get('timing', {})
+            ocr_t = t.get('total', 0.0)
+            slowest_ocr = max(slowest_ocr, ocr_t)
+            has_bc = 'BC:yes' if results_snapshot[cam_id].get('barcodes') else 'BC:no'
+            has_ocr = 'OCR:yes' if results_snapshot[cam_id].get('ocr_text') else 'OCR:no'
+            self.get_logger().info(
+                f'    Cam {cam_id} OCR+barcode: {ocr_t:.3f}s  [{has_ocr}  {has_bc}]'
+            )
+        self.get_logger().info(f'    ocr_node wall-clock (slowest cam): {slowest_ocr:.3f}s')
+        self.get_logger().info('')
+        self.get_logger().info('  [WSL -- database_matcher]')
+        self.get_logger().info('    Matcher processing: ~0.022s  (see matcher log for exact)')
+        self.get_logger().info('')
+        if end_to_end:
+            status = 'PASS' if end_to_end <= 3.0 else f'FAIL  (+{end_to_end - 3.0:.3f}s over target)'
+            self.get_logger().info(f'  TOTAL end-to-end: {end_to_end:.3f}s  [{status}]')
+        self.get_logger().info('=================================')
 
         result_msg = json.dumps({
             'ocr_text': fused_ocr,
@@ -537,10 +623,13 @@ class OCRProcessor(Node):
         'Gass': 'Gloss', 'Goss': 'Gloss', 'Gloss': 'Gloss', 'Gross': 'Gloss',
         'Stam': 'Stain', 'Stal': 'Stain', 'Stan': 'Stain', 'Stain': 'Stain',
         'Crean': 'Cream', 'Cram': 'Cream', 'Crear': 'Cream', 'Crearn': 'Cream',
-        'Lin': 'Lip', 'Lp': 'Lip', 'Liq': 'Lip',
+        'Lin': 'Lip', 'Lp': 'Lip', 'Liq': 'Lip', 'Li': 'Lip',
+        'Crea': 'Cream',
         'SEPHOR': 'SEPHORA', 'SEPHOF': 'SEPHORA', 'SEPHO': 'SEPHORA',
         'sEPHORA': 'SEPHORA', 'sEPHOR': 'SEPHORA', 'Sephora': 'SEPHORA',
         'SEPORA': 'SEPHORA', 'SEPHORS': 'SEPHORA',
+        'aty:': 'Qty:', 'aty': 'Qty', 'Oty:': 'Qty:', 'Oty': 'Qty',
+        'qty:': 'Qty:', 'QTY:': 'Qty:',
     }
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
@@ -557,18 +646,22 @@ class OCRProcessor(Node):
             clean = []
             for word, conf in zip(data['text'], data['conf']):
                 word = word.strip()
-                if int(conf) > min_conf and len(word) >= 2:
-                    if not re.match(r'^[A-Za-z0-9]+$', word):
+                if int(conf) > min_conf and (len(word) >= 2 or word.isdigit()):
+                    if not re.match(r'^[A-Za-z0-9:]+$', word):
                         continue
                     word = self.OCR_CORRECTIONS.get(word, word)
-                    if len(word) < 3:
+                    if len(word) < 3 and not word.isdigit():
                         continue
                     clean.append(word)
             if len(clean) > len(best_result):
                 best_result = clean
         return ' '.join(best_result)
 
-    OCR_NOISE_WORDS = {'ill', 'lll', 'lil', 'llI', 'III', 'iil', 'lli'}
+    OCR_NOISE_WORDS = {
+    'ill', 'lll', 'lil', 'llI', 'III', 'iil', 'lli',
+    'ban', 'say', 'Fal', 'iif', 'cae', 'wil', 'eam',
+    'aty', 'mtt', 'MTT', 'IRA',
+}
 
     def filter_barcode_text(self, text):
         text = re.sub(r'\b[A-Za-z]+-[A-Za-z]+-\d+\b', '', text)
@@ -576,7 +669,11 @@ class OCRProcessor(Node):
         words = [w for w in words if w not in self.OCR_NOISE_WORDS]
         text = ' '.join(words)
         text = re.sub(r'\s+', ' ', text).strip()
-        return text
+        # Drop result if nothing meaningful remains (all short tokens)
+        meaningful = [w for w in text.split() if len(w) >= 3 and not w.isdigit()]
+        if not meaningful:
+            return None
+        return text if text else None
 
 
 def main(args=None):
