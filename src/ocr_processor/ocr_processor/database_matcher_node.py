@@ -87,10 +87,16 @@ class DatabaseMatcherNode(Node):
             _, _, score, _ = self.matcher._enhanced_fuzzy_match(ocr_text, None, [product])
             scores.append((product, score))
         scores.sort(key=lambda x: x[1], reverse=True)
+        
+        # If only one product scores > 0, it's a unique match — no tie
+        non_zero = [s for s in scores if s[1] > 0]
+        if len(non_zero) <= 1:
+            return False
+        
         if len(scores) >= 2:
             top_score = scores[0][1]
             second_score = scores[1][1]
-            if top_score > 0 and abs(top_score - second_score) < 10:
+            if top_score > 0 and abs(top_score - second_score) < 5:
                 self.get_logger().warn(
                     f'TIE DETECTED — '
                     f'{scores[0][0][1]} ({scores[0][1]:.1f}) vs '
@@ -437,11 +443,11 @@ class DatabaseMatcherNode(Node):
             if not result or not result['matched']:
                 details = (result.get('match_details') or {}) if result else {}
                 self.log_results(
-                    matched=False, product=None, accuracy=50.0,
-                    confidence='AMBIGUOUS', verified=False,
+                    matched=False, product=None, accuracy=0.0,
+                    confidence='NO MATCH', verified=False,
                     barcode_used=None, barcodes=barcodes,
                     ocr_text=ocr_text, details=details,
-                    reason='TIE DETECTED, barcode needed',
+                    reason='OCR score too low — barcode needed',
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,

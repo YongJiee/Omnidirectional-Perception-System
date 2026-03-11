@@ -472,11 +472,11 @@ class SmartMatcher:
                 best_match = product
                 match_details = details
 
-        if best_score >= 65:
+        if best_score >= 40:
             confidence = "HIGH"
-        elif best_score >= 70:
+        elif best_score >= 35:
             confidence = "MEDIUM"
-        elif best_score >= 55:
+        elif best_score >= 25:
             confidence = "LOW"
         else:
             confidence = "NO MATCH"
