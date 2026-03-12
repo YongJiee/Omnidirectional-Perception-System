@@ -156,13 +156,12 @@ class DatabaseMatcherNode(Node):
 
         self.get_logger().info(f'  Score Breakdown:')
 
-        if barcode_used:
+        if barcode_used and confidence == 'CONFLICT':
+            self.get_logger().warn(f'    Barcode match:      CONFLICT — barcode matched [{barcode_used}] but contradicts OCR')
+        elif barcode_used:
             self.get_logger().info(f'    Barcode match:      100.0% (exact) [{barcode_used}]')
         elif barcodes:
-            if reason and 'conflict' in reason:
-                self.get_logger().warn(f'    Barcode match:      CONFLICT — barcodes: {barcodes}')
-            else:
-                self.get_logger().info(f'    Barcode match:      0.0% (no exact match) {barcodes}')
+            self.get_logger().info(f'    Barcode match:      0.0% (no exact match) {barcodes}')
         else:
             self.get_logger().info(f'    Barcode match:      0.0% (none provided)')
 
@@ -293,6 +292,17 @@ class DatabaseMatcherNode(Node):
                     f'[INBOUND] Cross-camera barcode CONFLICT: '
                     f'{[(cam, v[0], v[2]) for cam, v in cam_matches.items()]}'
                 )
+                self.matcher.db.save_scan(
+                    ocr_text=ocr_text,
+                    matched_product_id=None,
+                    match_confidence='CONFLICT',
+                    match_score=0.0,
+                    barcode=str(conflict_barcodes),
+                    device_id='PI-001',
+                    session_id=session_id,
+                    quantity=quantity,
+                    quantity_source=quantity_source
+                )
                 self.log_results(
                     matched=False, product=None, accuracy=0.0,
                     confidence='NO MATCH', verified=False,
@@ -387,6 +397,17 @@ class DatabaseMatcherNode(Node):
         if not barcodes:
             if self.check_tie(ocr_text, all_products):
                 _, _, _, details = self.matcher._enhanced_fuzzy_match(ocr_text, None, all_products)
+                self.matcher.db.save_scan(
+                    ocr_text=ocr_text,
+                    matched_product_id=None,
+                    match_confidence='TIE',
+                    match_score=50.0,
+                    barcode=None,
+                    device_id='PI-001',
+                    session_id=session_id,
+                    quantity=quantity,
+                    quantity_source=quantity_source
+                )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
                     confidence='AMBIGUOUS', verified=False,
@@ -413,6 +434,52 @@ class DatabaseMatcherNode(Node):
             except Exception as e:
                 self.get_logger().error(f'Exception in match_and_save: {e}')
             if result and result['matched'] and result.get('barcode_matched'):
+                # ── OCR vs barcode conflict check ─────────────────
+                barcode_product = result['product']
+                _, _, ocr_score, _ = self.matcher._enhanced_fuzzy_match(
+                    ocr_text, None, [barcode_product]
+                )
+                # Check if OCR strongly matches a DIFFERENT product
+                for p in all_products:
+                    if p[0] == barcode_product[0]:
+                        continue
+                    _, _, other_score, _ = self.matcher._enhanced_fuzzy_match(
+                        ocr_text, None, [p]
+                    )
+                    if other_score > ocr_score and other_score >= 40:
+                        self.get_logger().warn(
+                            f'[CONFLICT] Barcode says "{barcode_product[1]}" '
+                            f'but OCR strongly suggests "{p[1]}" '
+                            f'(barcode_ocr={ocr_score:.1f} vs ocr_only={other_score:.1f})'
+                        )
+                        # ── Delete matched scan, re-save as CONFLICT ──────────
+                        if result and result.get('scan_id'):
+                            self.matcher.db.delete_scan(result['scan_id'])
+                        self.matcher.db.save_scan(
+                            ocr_text=ocr_text,
+                            matched_product_id=None,
+                            match_confidence='CONFLICT',
+                            match_score=50.0,
+                            barcode=barcode,
+                            device_id='PI-001',
+                            session_id=session_id,
+                            quantity=quantity,
+                            quantity_source=quantity_source
+                        )
+                        _, _, _, conflict_details = self.matcher._enhanced_fuzzy_match(
+                            ocr_text, None, all_products
+                        )
+                        self.log_results(
+                            matched=False, product=None, accuracy=50.0,
+                            confidence='CONFLICT', verified=False,
+                            barcode_used=barcode, barcodes=barcodes,
+                            ocr_text=ocr_text, details=conflict_details,
+                            reason=f'CONFLICT — barcode={barcode_product[1]} vs OCR={p[1]}',
+                            quantity=quantity, quantity_source=quantity_source
+                        )
+                        self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
+                                        mode, scan_mode, per_camera)
+                        return
                 barcode_used = barcode
                 break
 
@@ -421,6 +488,17 @@ class DatabaseMatcherNode(Node):
             barcode_used = None
             if self.check_tie(ocr_text, all_products):
                 details = (result.get('match_details') or {}) if result else {}
+                self.matcher.db.save_scan(
+                    ocr_text=ocr_text,
+                    matched_product_id=None,
+                    match_confidence='TIE',
+                    match_score=50.0,
+                    barcode=None,
+                    device_id='PI-001',
+                    session_id=session_id,
+                    quantity=quantity,
+                    quantity_source=quantity_source
+                )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
                     confidence='AMBIGUOUS', verified=False,
@@ -462,14 +540,20 @@ class DatabaseMatcherNode(Node):
         if result and result['matched']:
             if result['accuracy'] < 95.0:
                 self.get_logger().warn(
-                    f'Accuracy {result["accuracy"]:.1f}% below 95% threshold — rejecting'
+                    f'Accuracy {result["accuracy"]:.1f}% below 95% threshold — flagging'
+                )
+                self.matcher.db.update_scan(
+                    scan_id=result['scan_id'],
+                    match_confidence='LOW_CONFIDENCE',
+                    verified=0,
+                    notes=f'Accuracy {result["accuracy"]:.1f}% below 95% threshold'
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=result['accuracy'],
-                    confidence=result['confidence'], verified=False,
+                    confidence='LOW_CONFIDENCE', verified=False,
                     barcode_used=barcode_used, barcodes=barcodes,
                     ocr_text=ocr_text, details=details,
-                    reason=f'accuracy {result["accuracy"]:.1f}% below 95% threshold',
+                    reason=f'accuracy {result["accuracy"]:.1f}% below 95% threshold — flagged',
                     quantity=result_qty, quantity_source=result_qty_src
                 )
             else:

@@ -602,6 +602,37 @@ class DatabaseManager:
             self.add_product(p[0], p[1], p[2], p[3], p[4], p[5])
         print("\n✓ Sample products added successfully!")
 
+    def delete_scan(self, scan_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM scans WHERE id = ?', (scan_id,))
+        conn.commit()
+        conn.close()
+
+    def update_scan(self, scan_id, match_confidence=None, verified=None, notes=None):
+        fields = []
+        values = []
+        if match_confidence is not None:
+            fields.append('match_confidence = ?')
+            values.append(match_confidence)
+        if verified is not None:
+            fields.append('verified = ?')
+            values.append(verified)
+        if notes is not None:
+            fields.append('notes = ?')
+            values.append(notes)
+        if not fields:
+            return
+        values.append(scan_id)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f'UPDATE scans SET {", ".join(fields)} WHERE id = ?',
+            values
+        )
+        conn.commit()
+        conn.close()
+
 
 if __name__ == "__main__":
     print("\n### DATABASE MANAGER TEST ###")
