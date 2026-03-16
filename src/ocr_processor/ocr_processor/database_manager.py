@@ -10,10 +10,9 @@ class DatabaseManager:
         self.create_tables()
     
     def create_tables(self):
-        """Create all necessary tables"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Products table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS products (
@@ -27,7 +26,7 @@ class DatabaseManager:
                 created_date DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         # Scan sessions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scan_sessions (
@@ -40,7 +39,6 @@ class DatabaseManager:
         ''')
 
         # Scans table
-        # quantity is nullable — NULL means flagged (inbound, qty unreadable)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,10 +54,11 @@ class DatabaseManager:
                 session_id INTEGER REFERENCES scan_sessions(id),
                 quantity INTEGER,
                 quantity_source TEXT DEFAULT 'default',
+                scan_mode TEXT DEFAULT 'inbound',
                 FOREIGN KEY (matched_product_id) REFERENCES products(id)
             )
         ''')
-        
+
         # Inventory table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
@@ -71,7 +70,7 @@ class DatabaseManager:
                 FOREIGN KEY (product_id) REFERENCES products(id)
             )
         ''')
-        
+
         conn.commit()
         conn.close()
 
@@ -168,7 +167,7 @@ class DatabaseManager:
     
     def save_scan(self, ocr_text, matched_product_id, match_confidence, match_score,
                   barcode=None, device_id=None, notes=None,
-                  session_id=None, quantity=1, quantity_source='default'):
+                  session_id=None, quantity=1, quantity_source='default', scan_mode='inbound'):
         """
         Save scan result to database.
 
@@ -194,12 +193,12 @@ class DatabaseManager:
             INSERT INTO scans (
                 ocr_text, barcode, matched_product_id, match_confidence,
                 match_score, verified, device_id, notes,
-                session_id, quantity, quantity_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, quantity, quantity_source, scan_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             ocr_text, barcode, matched_product_id, match_confidence,
             match_score, verified, device_id, notes,
-            session_id, db_quantity, quantity_source
+            session_id, db_quantity, quantity_source, scan_mode
         ))
         
         scan_id = cursor.lastrowid

@@ -70,6 +70,7 @@ class OCRProcessor(Node):
         self.camera_results_lock = threading.Lock()
         self.overall_start = None
         self.batch_save_dir = None
+        self.clock_offset = None 
         self.batch_already_processed = False
         self._fuse_triggered = False
 
@@ -107,7 +108,6 @@ class OCRProcessor(Node):
             if camera_id in self.camera_results:
                 self.get_logger().warn(f'Camera {camera_id} already processed, skipping duplicate')
                 return
-            self.batch_already_processed = False
 
         self.get_logger().info(f'Image received from camera {camera_id}')
 
@@ -120,6 +120,14 @@ class OCRProcessor(Node):
             cam_start = time.time()
             if self.overall_start is None:
                 self.overall_start = cam_start
+
+        if self.clock_offset is None:
+            try:
+                pi_time = float(msg.header.frame_id.split(',')[1])
+                self.clock_offset = time.time() - pi_time
+                self.get_logger().info(f'Clock offset: {self.clock_offset:.3f}s')
+            except Exception:
+                pass
 
         thread = threading.Thread(
             target=self._process_and_collect,
@@ -163,6 +171,7 @@ class OCRProcessor(Node):
             self.batch_save_dir = parts[0]
             if self.overall_start is None and len(parts) > 1:
                 self.overall_start = float(parts[1])
+            self.pi_cycle_time = float(parts[2]) if len(parts) > 2 else None
         except Exception:
             pass
 
@@ -347,15 +356,18 @@ class OCRProcessor(Node):
     def process_single_image(self, msg, camera_id, cam_start):
         processing_start = time.time()
         network_latency = processing_start - cam_start  # time from Pi publish to WSL receive
+        # ADD this guard
+        if network_latency < 0 or network_latency > 10:
+            network_latency = 0.0  # clocks not synced — ignore
 
         decode_start = time.time()
         np_arr = np.frombuffer(msg.data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+        gray = frame
         decode_time = time.time() - decode_start
 
         cv2.imwrite(f'/tmp/camera_{camera_id}_received.jpg', frame)
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape
         if width > 1280:
             scale = 1280 / width
@@ -511,7 +523,14 @@ class OCRProcessor(Node):
 
         fused_ocr = ' '.join(all_ocr_parts) if all_ocr_parts else None
         fuse_time = time.time() - fuse_start
-        end_to_end = time.time() - self.overall_start if self.overall_start else None
+        if self.overall_start and self.clock_offset:
+            end_to_end = time.time() - (self.overall_start + self.clock_offset)
+        else:
+            end_to_end = None
+        # ADD this guard
+        if end_to_end and end_to_end > 30:
+            end_to_end = None  # clock mismatch — cannot measure cross-device e2e
+            self.get_logger().warn('End-to-end timing unavailable — Pi/WSL clocks not synced')
 
         # ── Raw quantity extraction — no stage rules applied here ──
         qty_raw, qty_source_raw = extract_quantity_raw(fused_ocr or '')
@@ -604,7 +623,9 @@ class OCRProcessor(Node):
             'end_to_end_time': end_to_end,
             'save_dir': self.batch_save_dir,
             'quantity_raw': qty_raw,           # raw OCR value, may be None
-            'quantity_source_raw': qty_source_raw  # 'ocr' or None
+            'quantity_source_raw': qty_source_raw,  # 'ocr' or None
+            'clock_offset': self.clock_offset,
+            'pi_cycle_time': self.pi_cycle_time,
         })
         self.result_publisher.publish(String(data=result_msg))
         self.get_logger().info('Fused result published to /ocr_results')
@@ -615,6 +636,9 @@ class OCRProcessor(Node):
             self._fuse_triggered = False
         self.overall_start = None
         self.batch_save_dir = None
+        self.clock_offset = None 
+        self.pi_cycle_time = None
+        self.pi_cycle_time = None
 
     # ---------------------------------------------------------------
     # Helpers
@@ -632,6 +656,8 @@ class OCRProcessor(Node):
         'SEPORA': 'SEPHORA', 'SEPHORS': 'SEPHORA',
         'aty:': 'Qty:', 'aty': 'Qty', 'Oty:': 'Qty:', 'Oty': 'Qty',
         'qty:': 'Qty:', 'QTY:': 'Qty:',
+        'FRiDays': 'FRIDAYS','FRiDaYs': 'FRIDAYS','Fridays': 'FRIDAYS',
+        'FRIDAS': 'FRIDAYS',
     }
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
@@ -662,8 +688,9 @@ class OCRProcessor(Node):
     OCR_NOISE_WORDS = {
     'ill', 'lll', 'lil', 'llI', 'III', 'iil', 'lli',
     'ban', 'say', 'Fal', 'iif', 'cae', 'wil', 'eam',
-    'aty', 'mtt', 'MTT', 'IRA', 'Lee', 'aig', 'ait'
-    'Bee', 'ges'
+    'aty', 'mtt', 'MTT', 'IRA', 'Lee', 'aig', 'ait',
+    'Bee', 'ges', 'pig', 'wer', 'Ake', 'ant', 'bal',
+    'pad', 'fig',
 }
 
     def filter_barcode_text(self, text):

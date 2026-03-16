@@ -177,10 +177,11 @@ class DatabaseMatcherNode(Node):
     # Timing log — full pipeline breakdown
     # ---------------------------------------------------------------
     def log_timing(self, callback_start, overall_start, end_to_end_from_ocr,
-                   mode, scan_mode='sorting', per_camera=None):
+               mode, scan_mode='sorting', per_camera=None, 
+               clock_offset=0.0, pi_cycle_time=None):
         matcher_time = time.time() - callback_start
         now = time.time()
-        full_end_to_end = now - overall_start if overall_start else None
+        full_end_to_end = now - (overall_start + clock_offset) if overall_start else None
 
         self.get_logger().info('\n=== PIPELINE TIMING BREAKDOWN ===')
 
@@ -224,10 +225,35 @@ class DatabaseMatcherNode(Node):
         # ── Total ─────────────────────────────────────────────────
         self.get_logger().info('')
         self.get_logger().info(f'  Mode: {mode} [{scan_mode}]')
-        if full_end_to_end is not None:
+
+        if pi_cycle_time and per_camera:
+            # Find when last camera fully finished on WSL
+            # = cam_offset + network_delay + OCR_time
+            latest_finish = 0.0
+            for cam_id in per_camera:
+                t = per_camera[cam_id].get('timing', {})
+                offset = t.get('cam_start_offset', 0.0)
+                network = t.get('network_latency', 0.0)
+                ocr = t.get('total', 0.0)
+                finish = offset + network + ocr
+                latest_finish = max(latest_finish, finish)
+            
+            true_e2e = latest_finish + matcher_time
+            status = 'PASS' if true_e2e <= 3.0 else f'FAIL  (+{true_e2e - 3.0:.3f}s over target)'
+            self.get_logger().info(f'  Pi capture cycle:   {pi_cycle_time:.3f}s')
+            self.get_logger().info(f'  Last cam finish:    {latest_finish:.3f}s')
+            self.get_logger().info(f'  Matcher:            {matcher_time:.3f}s')
+            self.get_logger().info(
+                f'  TOTAL end-to-end:   {true_e2e:.3f}s  [{status}]'
+            )
+        elif full_end_to_end is not None and 0 < full_end_to_end < 30:
             status = 'PASS' if full_end_to_end <= 3.0 else f'FAIL  (+{full_end_to_end - 3.0:.3f}s over target)'
             self.get_logger().info(
                 f'  TOTAL end-to-end (Pi init -> OCR -> DB): {full_end_to_end:.3f}s  [{status}]'
+            )
+        else:
+            self.get_logger().info(
+                '  TOTAL end-to-end: unavailable (Pi/WSL clocks not synced)'
             )
         self.get_logger().info('=================================')
 
@@ -251,6 +277,8 @@ class DatabaseMatcherNode(Node):
             data.get('camera_capture_time')
         )
         end_to_end_from_ocr = data.get('end_to_end_time')
+        clock_offset = data.get('clock_offset') or 0.0
+        pi_cycle_time = data.get('pi_cycle_time')
 
         raw_barcode = data.get('barcode')
         barcodes = self.parse_barcodes(raw_barcode)
@@ -301,7 +329,8 @@ class DatabaseMatcherNode(Node):
                     device_id='PI-001',
                     session_id=session_id,
                     quantity=quantity,
-                    quantity_source=quantity_source
+                    quantity_source=quantity_source,
+                    scan_mode=scan_mode 
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=0.0,
@@ -312,7 +341,7 @@ class DatabaseMatcherNode(Node):
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                mode, scan_mode, per_camera)
+                                mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                 return
 
             elif len(unique_products) == 1:
@@ -343,7 +372,7 @@ class DatabaseMatcherNode(Node):
                 quantity=quantity, quantity_source=quantity_source
             )
             self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                            mode, scan_mode, per_camera)
+                            mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
             return
 
         # ── Reject if multiple barcodes match different products ──
@@ -368,7 +397,7 @@ class DatabaseMatcherNode(Node):
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                mode, scan_mode, per_camera)
+                                mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                 return
 
         if per_camera:
@@ -390,7 +419,7 @@ class DatabaseMatcherNode(Node):
                 quantity=quantity, quantity_source=quantity_source
             )
             self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                            mode, scan_mode, per_camera)
+                            mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
             return
 
         # ── Tie check if OCR-only ─────────────────────────────────
@@ -406,7 +435,8 @@ class DatabaseMatcherNode(Node):
                     device_id='PI-001',
                     session_id=session_id,
                     quantity=quantity,
-                    quantity_source=quantity_source
+                    quantity_source=quantity_source,
+                    scan_mode=scan_mode 
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
@@ -417,7 +447,7 @@ class DatabaseMatcherNode(Node):
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                mode, scan_mode, per_camera)
+                                mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                 return
 
         # ── Try each barcode until exact DB match ─────────────────
@@ -464,7 +494,8 @@ class DatabaseMatcherNode(Node):
                             device_id='PI-001',
                             session_id=session_id,
                             quantity=quantity,
-                            quantity_source=quantity_source
+                            quantity_source=quantity_source,
+                            scan_mode=scan_mode 
                         )
                         _, _, _, conflict_details = self.matcher._enhanced_fuzzy_match(
                             ocr_text, None, all_products
@@ -478,7 +509,7 @@ class DatabaseMatcherNode(Node):
                             quantity=quantity, quantity_source=quantity_source
                         )
                         self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                        mode, scan_mode, per_camera)
+                                        mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                         return
                 barcode_used = barcode
                 break
@@ -497,7 +528,8 @@ class DatabaseMatcherNode(Node):
                     device_id='PI-001',
                     session_id=session_id,
                     quantity=quantity,
-                    quantity_source=quantity_source
+                    quantity_source=quantity_source,
+                    scan_mode=scan_mode 
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
@@ -508,7 +540,7 @@ class DatabaseMatcherNode(Node):
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                mode, scan_mode, per_camera)
+                                mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                 return
 
             result = self.matcher.match_and_save(
@@ -529,7 +561,7 @@ class DatabaseMatcherNode(Node):
                     quantity=quantity, quantity_source=quantity_source
                 )
                 self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                                mode, scan_mode, per_camera)
+                                mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
                 return
 
         # ── Final result ──────────────────────────────────────────
@@ -590,7 +622,7 @@ class DatabaseMatcherNode(Node):
             )
 
         self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
-                        mode, scan_mode, per_camera)
+                        mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
 
 
 def main(args=None):

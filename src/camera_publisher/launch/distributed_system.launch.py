@@ -7,7 +7,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     #pi_host = 'team9camera@172.20.10.2' #"WIFI"
-    pi_host = 'team9camera@192.168.10.1'
+    pi_host = 'team9camera@192.168.10.1' #Ethernet
 
     # ---------------------------------------------------------------
     # Launch arguments
@@ -114,8 +114,8 @@ def generate_launch_description():
                         'ssh', pi_host,
                         [
                             'bash -c "export ROS_DOMAIN_ID=30 && '
-                            'export ROS_IP=192.168.10.1 && '
-                            'export ROS_HOSTNAME=192.168.10.1 && '
+                            'export ROS_IP=172.20.10.2 && '
+                            'export ROS_HOSTNAME=172.20.10.2 && '
                             'source /home/team9camera/ros2_humble/install/setup.bash && '
                             'cd /home/team9camera/Project4_ws && '
                             'source install/setup.bash && '

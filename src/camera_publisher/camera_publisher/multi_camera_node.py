@@ -29,12 +29,6 @@ class MultiCameraPublisher(Node):
         self.num_cameras = self.get_parameter('num_cameras').get_parameter_value().integer_value
         self.get_logger().info(f'Mode: {self.num_cameras}-camera')
 
-        # Create timestamped folder for this run
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.save_dir = os.path.expanduser(f'~/camera_captures/{timestamp}')
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.get_logger().info(f'Saving images to: {self.save_dir}')
-
         # Publishers â€” one per camera with reliable QoS to prevent message drops
         self.publishers_ = {}
         for i in range(self.num_cameras):
@@ -82,7 +76,7 @@ class MultiCameraPublisher(Node):
             # Fixed focus (no autofocus delay)
             focus_start = time.time()
             cam.set_controls({"AfMode": 0, "LensPosition": 4.0})
-            time.sleep(0.2)
+            time.sleep(0.05)
             focus_time = time.time() - focus_start
 
             # Capture
@@ -92,21 +86,13 @@ class MultiCameraPublisher(Node):
             cam.close()
             capture_time = time.time() - capture_start
 
-            # Convert BGR
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            # Save locally
-            save_start = time.time()
-            filename = f'camera_{camera_id}.jpg'
-            save_path = os.path.join(self.save_dir, filename)
-            cv2.imwrite(save_path, frame_bgr)
-            save_time = time.time() - save_start
-            self.get_logger().info(f'Saved: {save_path}')
+            # Convert to grayscale on Pi before encoding
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
             # Encode JPEG
             encode_start = time.time()
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-            _, buffer = cv2.imencode('.jpg', frame_bgr, encode_param)
+            _, buffer = cv2.imencode('.jpg', frame, encode_param)
             encode_time = time.time() - encode_start
 
             # Publish
@@ -127,7 +113,6 @@ class MultiCameraPublisher(Node):
             self.get_logger().info(f'  Init:        {init_time:.3f}s')
             self.get_logger().info(f'  Fixed focus: {focus_time:.3f}s')
             self.get_logger().info(f'  Capture:     {capture_time:.3f}s')
-            self.get_logger().info(f'  Save local:  {save_time:.3f}s')
             self.get_logger().info(f'  JPEG encode: {encode_time:.3f}s')
             self.get_logger().info(f'  ROS publish: {publish_time:.3f}s')
             self.get_logger().info(f'  Total:       {elapsed:.3f}s')
@@ -149,21 +134,21 @@ class MultiCameraPublisher(Node):
         for camera_id in range(self.num_cameras):
             success = self.capture_single_camera(camera_id)
             results.append((camera_id, success))
+        
+        total = time.time() - self.overall_start
 
         success_count = sum(1 for _, s in results if s)
         self.get_logger().info(f'Captured {success_count}/{self.num_cameras} cameras successfully')
 
         # ── SEND SIGNAL IMMEDIATELY after all images published ──
         batch_msg = String()
-        batch_msg.data = f'{self.save_dir},{self.overall_start}'
+        batch_msg.data = f'none,{self.overall_start},{total}'
         self.batch_pub.publish(batch_msg)
         self.get_logger().info('Batch complete signal sent to WSL')
 
         # ── THEN do the slow stuff ──
         total = time.time() - self.overall_start
         self.get_logger().info(f'=== Cycle complete: {total:.3f}s ===')
-        self.get_logger().info(f'All images saved to: {self.save_dir}')  # ← this was before publish
-
         time.sleep(4.0)
 
 

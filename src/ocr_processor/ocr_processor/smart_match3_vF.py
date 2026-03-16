@@ -348,7 +348,8 @@ class SmartMatcher:
             notes=notes,
             session_id=session_id,
             quantity=quantity if quantity is not None else 1,
-            quantity_source=quantity_source
+            quantity_source=quantity_source,
+            scan_mode=scan_mode
         )
 
         processing_time = time.time() - start_time
