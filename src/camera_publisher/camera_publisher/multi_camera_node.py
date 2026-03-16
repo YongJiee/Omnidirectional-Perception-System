@@ -9,7 +9,7 @@ import cv2
 import os
 from datetime import datetime
 
-# Reliable QoS â€” guarantees message delivery, no drops
+# Reliable QoS — guarantees message delivery, no drops
 RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
@@ -22,14 +22,21 @@ class MultiCameraPublisher(Node):
         super().__init__('multi_camera_publisher')
 
         # ---------------------------------------------------------------
-        # Number of cameras â€” controlled from launch file
-        # ros2 run camera_publisher multi_camera_node --ros-args -p num_cameras:=2
+        # Number of cameras — controlled from launch file
         # ---------------------------------------------------------------
         self.declare_parameter('num_cameras', 4)
         self.num_cameras = self.get_parameter('num_cameras').get_parameter_value().integer_value
-        self.get_logger().info(f'Mode: {self.num_cameras}-camera')
 
-        # Publishers â€” one per camera with reliable QoS to prevent message drops
+        # ---------------------------------------------------------------
+        # Scan mode — inbound = capture immediately on start
+        #             sorting  = wait for /trigger_capture signal
+        # ---------------------------------------------------------------
+        self.declare_parameter('scan_mode', 'inbound')
+        self.scan_mode = self.get_parameter('scan_mode').get_parameter_value().string_value
+
+        self.get_logger().info(f'Mode: {self.num_cameras}-camera [{self.scan_mode}]')
+
+        # Publishers — one per camera with reliable QoS to prevent message drops
         self.publishers_ = {}
         for i in range(self.num_cameras):
             self.publishers_[i] = self.create_publisher(
@@ -41,9 +48,35 @@ class MultiCameraPublisher(Node):
 
         self.get_logger().info(f'Waiting for {self.num_cameras} OCR subscriber(s)...')
         self._wait_for_subscribers()
+        self.get_logger().info('All subscribers detected!')
 
-        self.get_logger().info('All subscribers detected! Starting capture...')
-        self.capture_all_cameras()
+        if self.scan_mode == 'inbound':
+            # Inbound — capture immediately as before
+            self.get_logger().info('Inbound mode — starting capture now')
+            self.capture_all_cameras()
+        else:
+            # Sorting — wait for trigger from database_matcher_node
+            self._capturing = False
+            self.trigger_sub = self.create_subscription(
+                String, '/trigger_capture', self.on_trigger, RELIABLE_QOS
+            )
+            self.get_logger().info(
+                'Sorting mode — waiting for /trigger_capture signal...'
+            )
+
+    # ---------------------------------------------------------------
+    # Trigger callback — sorting mode only
+    # ---------------------------------------------------------------
+    def on_trigger(self, msg):
+        if msg.data == 'capture':
+            if self._capturing:
+                self.get_logger().warn('Capture already in progress — ignoring trigger')
+                return
+            self.get_logger().info('Trigger received — starting capture')
+            self._capturing = True
+            self.capture_all_cameras()
+            self._capturing = False
+            self.get_logger().info('Capture complete — ready for next trigger')
 
     # ---------------------------------------------------------------
     # Wait until all camera topics have a subscriber (WSL OCR node)
@@ -86,9 +119,6 @@ class MultiCameraPublisher(Node):
             cam.close()
             capture_time = time.time() - capture_start
 
-            # Convert to grayscale on Pi before encoding
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-
             # Encode JPEG
             encode_start = time.time()
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
@@ -125,38 +155,40 @@ class MultiCameraPublisher(Node):
 
     # ---------------------------------------------------------------
     # Capture all cameras sequentially, then signal batch complete
-    # Arducam mux requires sequential capture â€” cannot parallelise
+    # Arducam mux requires sequential capture — cannot parallelise
     # ---------------------------------------------------------------
     def capture_all_cameras(self):
         self.overall_start = time.time()
-        
+
         results = []
         for camera_id in range(self.num_cameras):
             success = self.capture_single_camera(camera_id)
             results.append((camera_id, success))
-        
+
         total = time.time() - self.overall_start
 
         success_count = sum(1 for _, s in results if s)
         self.get_logger().info(f'Captured {success_count}/{self.num_cameras} cameras successfully')
 
-        # ── SEND SIGNAL IMMEDIATELY after all images published ──
+        # Send batch complete signal immediately after all images published
         batch_msg = String()
         batch_msg.data = f'none,{self.overall_start},{total}'
         self.batch_pub.publish(batch_msg)
         self.get_logger().info('Batch complete signal sent to WSL')
 
-        # ── THEN do the slow stuff ──
         total = time.time() - self.overall_start
         self.get_logger().info(f'=== Cycle complete: {total:.3f}s ===')
-        time.sleep(4.0)
+
+        # Only loop continuously in inbound mode
+        if self.scan_mode == 'inbound':
+            time.sleep(4.0)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MultiCameraPublisher()
-    # Spin briefly to allow any pending callbacks/deliveries to complete
-    rclpy.spin_once(node, timeout_sec=0.0)
+    # Spin to keep node alive — handles both inbound (done) and sorting (waiting for trigger)
+    rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
 

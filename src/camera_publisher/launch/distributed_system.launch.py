@@ -6,8 +6,8 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    #pi_host = 'team9camera@172.20.10.2' #"WIFI"
-    pi_host = 'team9camera@192.168.10.1' #Ethernet
+    pi_host = 'team9camera@172.20.10.2' #"WIFI"
+    #pi_host = 'team9camera@192.168.10.1' #Ethernet
 
     # ---------------------------------------------------------------
     # Launch arguments
@@ -99,6 +99,7 @@ def generate_launch_description():
                     parameters=[
                         {'num_cameras': num_cameras},
                         {'image_dir': image_dir},
+                        {'scan_mode': scan_mode},
                     ],
                 ),
             ]
@@ -122,6 +123,8 @@ def generate_launch_description():
                             'ros2 run camera_publisher multi_camera_node '
                             '--ros-args -p num_cameras:=',
                             num_cameras,
+                            ' -p scan_mode:=',
+                            scan_mode,
                             '"'
                         ]
                     ],

@@ -1,21 +1,40 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import String
 import json
 import sys
 import os
 import re
 import time
+import threading
 from fuzzywuzzy import fuzz
 
 sys.path.append(os.path.dirname(__file__))
 from smart_match3_vF import SmartMatcher, resolve_quantity
+
+RELIABLE_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10
+)
+
+# ---------------------------------------------------------------
+# CamelCase splitter
+# "CreamLipGloss"   →  "Cream Lip Gloss"
+# "SEPHORALipStain" →  "SEPHORA Lip Stain"
+# ---------------------------------------------------------------
+def split_camel_case(name: str) -> str:
+    s = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', s)
+    return s.strip()
 
 
 class DatabaseMatcherNode(Node):
     def __init__(self):
         super().__init__('database_matcher')
 
+        # ── Existing subscription: OCR results from ocr_node ──
         self.subscription = self.create_subscription(
             String,
             '/ocr_results',
@@ -23,12 +42,272 @@ class DatabaseMatcherNode(Node):
             10
         )
 
+        # ── NEW: Robot arm integration ─────────────────────────
+        # Subscribe to robot arm messages (product name + pos1)
+        self.robot_sub = self.create_subscription(
+            String,
+            '/robot_data',
+            self.on_robot_data,
+            10
+        )
+        # Publish pass/fail back to robot arm
+        self.robot_cmd_pub = self.create_publisher(String, '/robot_command', 10)
+        # Trigger Pi cameras on demand (sorting mode)
+        self.trigger_pub = self.create_publisher(String, '/trigger_capture', RELIABLE_QOS)
+
+        # ── Robot state machine ────────────────────────────────
+        # 'idle'       — waiting for product name from robot
+        # 'await_pos1' — name matched <95%, waiting for pos1
+        # 'await_ocr'  — cameras triggered, waiting for OCR result
+        self._robot_state      = 'idle'
+        self._robot_state_lock = threading.Lock()
+        self._pending_robot_name   = None  # raw e.g. "CreamLipGloss"
+        self._pending_ocr_text     = None  # split e.g. "Cream Lip Gloss"
+        self._pending_session_id   = None
+        self._pending_name_result  = None
+        self._pos1_timer           = None
+        self._ocr_timer            = None
+
+        # Timeouts
+        self.POS1_TIMEOUT = 30.0   # seconds to wait for pos1
+        self.OCR_TIMEOUT  = 10.0   # seconds to wait for OCR after cameras triggered
+
         self.matcher = SmartMatcher(device_id='PI-001', location='Warehouse')
 
         self.current_session_id = None
         self.current_session_stage = None
 
         self.get_logger().info('Database Matcher Node ready')
+        self.get_logger().info('Robot arm integration active — listening on /robot_data')
+
+    # ===========================================================
+    # ROBOT ARM INTEGRATION
+    # ===========================================================
+
+    # ---------------------------------------------------------------
+    # /robot_data callback — receives product name and pos1
+    # ---------------------------------------------------------------
+    def on_robot_data(self, msg):
+        data = msg.data.strip()
+        self.get_logger().info(f'[/robot_data] received: "{data}"')
+
+        with self._robot_state_lock:
+            state = self._robot_state
+
+        # ── pos1 signal ────────────────────────────────────────
+        if data == 'pos1':
+            with self._robot_state_lock:
+                if self._robot_state != 'await_pos1':
+                    self.get_logger().warn(
+                        f'pos1 received but robot state is "{self._robot_state}" — ignoring'
+                    )
+                    return
+                name_result = self._pending_name_result
+                robot_name  = self._pending_robot_name
+                ocr_text    = self._pending_ocr_text
+                self._robot_state = 'idle' if name_result is not None else 'await_ocr'
+
+            self._cancel_pos1_timer()
+
+            if name_result is not None:
+                # ── ≥95% name match confirmed by pos1 — send pass ──
+                self.get_logger().info(
+                    'pos1 received — name ≥95% confirmed, sending pass'
+                )
+                product = name_result['product']
+                details = name_result.get('match_details') or {}
+                self.log_results(
+                    matched=True,
+                    product=product,
+                    accuracy=name_result['accuracy'],
+                    confidence=name_result.get('confidence', 'HIGH'),
+                    verified=name_result.get('verified', True),
+                    barcode_used=None,
+                    barcodes=[],
+                    ocr_text=ocr_text,
+                    details=details,
+                    quantity=name_result.get('quantity'),
+                    quantity_source=name_result.get('quantity_source', 'default')
+                )
+                self.get_logger().info('\n=== PIPELINE TIMING (ROBOT NAME MATCH) ===')
+                self.get_logger().info(f'  Source:    robot arm end-effector OCR')
+                self.get_logger().info(f'  Input:     "{robot_name}" → "{ocr_text}"')
+                self.get_logger().info(f'  Result:    PASS — name ≥95%, confirmed by pos1')
+                self.get_logger().info('==========================================')
+                self._publish_robot_command('pass')
+                self._robot_reset_state()
+            else:
+                # ── <95% — trigger cameras ─────────────────────────
+                self.get_logger().info(
+                    'pos1 received — box in camera zone, triggering Pi cameras'
+                )
+                self._trigger_cameras()
+            return
+
+        # ── Product name from robot ────────────────────────────
+        if state != 'idle':
+            self.get_logger().warn(
+                f'Product name "{data}" received while robot state="{state}" — resetting'
+            )
+            self._robot_reset_state()
+
+        self._handle_robot_name(data)
+
+    # ---------------------------------------------------------------
+    # Step 1 — DB lookup on robot product name
+    # ---------------------------------------------------------------
+    def _handle_robot_name(self, robot_name: str):
+        name_start = time.time()
+        ocr_text   = split_camel_case(robot_name)
+        session_id = self.get_or_create_session('sorting')
+
+        self.get_logger().info(
+            f'[ROBOT] name: "{robot_name}" → split: "{ocr_text}"'
+        )
+
+        quantity, quantity_source = resolve_quantity(ocr_text, 'sorting')
+
+        try:
+            result = self.matcher.match_and_save(
+                ocr_text=ocr_text,
+                barcode=None,
+                session_id=session_id,
+                scan_mode='sorting'
+            )
+        except Exception as e:
+            self.get_logger().error(f'[ROBOT] SmartMatcher error: {e}')
+            result = None
+
+        accuracy = result['accuracy'] if result and result.get('matched') else 0.0
+        matched  = result and result.get('matched') and accuracy >= 95.0
+
+        self.get_logger().info(
+            f'[ROBOT] DB lookup: accuracy={accuracy:.1f}%  matched={matched}'
+        )
+
+        if matched:
+            # ── ≥95% — store result, wait for pos1 before sending pass ─
+            self.get_logger().info(
+                f'[ROBOT] name ≥95% matched — waiting for pos1 before sending pass'
+            )
+            with self._robot_state_lock:
+                self._robot_state         = 'await_pos1'
+                self._pending_robot_name  = robot_name
+                self._pending_ocr_text    = ocr_text
+                self._pending_session_id  = session_id
+                self._pending_name_result = result  # stored for logging when pos1 arrives
+
+            self._pos1_timer = threading.Timer(
+                self.POS1_TIMEOUT, self._on_pos1_timeout
+            )
+            self._pos1_timer.daemon = True
+            self._pos1_timer.start()
+
+        else:
+            # ── <95% — wait for pos1 to trigger cameras ───────
+            self.get_logger().info(
+                f'[ROBOT] accuracy {accuracy:.1f}% < 95% — '
+                f'waiting for pos1 to trigger camera capture'
+            )
+
+            if result and result.get('scan_id'):
+                self.matcher.db.update_scan(
+                    scan_id=result['scan_id'],
+                    match_confidence='LOW_CONFIDENCE',
+                    verified=0,
+                    notes=f'Robot name match {accuracy:.1f}% — awaiting camera verification'
+                )
+
+            with self._robot_state_lock:
+                self._robot_state        = 'await_pos1'
+                self._pending_robot_name = robot_name
+                self._pending_ocr_text   = ocr_text
+                self._pending_session_id = session_id
+
+            # Watchdog — send fail if pos1 never arrives
+            self._pos1_timer = threading.Timer(
+                self.POS1_TIMEOUT, self._on_pos1_timeout
+            )
+            self._pos1_timer.daemon = True
+            self._pos1_timer.start()
+
+    # ---------------------------------------------------------------
+    # Step 2 — Trigger Pi cameras
+    # ---------------------------------------------------------------
+    def _trigger_cameras(self):
+        trigger_msg = String()
+        trigger_msg.data = 'capture'
+        self.trigger_pub.publish(trigger_msg)
+        self.get_logger().info('[ROBOT] Capture trigger sent to /trigger_capture')
+
+        # Watchdog — send fail if OCR never arrives
+        self._ocr_timer = threading.Timer(
+            self.OCR_TIMEOUT, self._on_ocr_timeout
+        )
+        self._ocr_timer.daemon = True
+        self._ocr_timer.start()
+
+    # ---------------------------------------------------------------
+    # Publish pass/fail to robot
+    # ---------------------------------------------------------------
+    def _publish_robot_command(self, command: str):
+        msg = String()
+        msg.data = command
+        self.robot_cmd_pub.publish(msg)
+        self.get_logger().info(f'[ROBOT] → /robot_command: "{command}"')
+
+    # ---------------------------------------------------------------
+    # Timeout handlers
+    # ---------------------------------------------------------------
+    def _on_pos1_timeout(self):
+        with self._robot_state_lock:
+            if self._robot_state != 'await_pos1':
+                return
+            self._robot_state = 'idle'
+        self.get_logger().warn(
+            f'[ROBOT] pos1 timeout after {self.POS1_TIMEOUT}s '
+            f'— sending fail for "{self._pending_robot_name}"'
+        )
+        self._publish_robot_command('fail')
+        self._robot_reset_state()
+
+    def _on_ocr_timeout(self):
+        with self._robot_state_lock:
+            if self._robot_state != 'await_ocr':
+                return
+            self._robot_state = 'idle'
+        self.get_logger().warn(
+            f'[ROBOT] OCR timeout after {self.OCR_TIMEOUT}s — sending fail'
+        )
+        self._publish_robot_command('fail')
+        self._robot_reset_state()
+
+    # ---------------------------------------------------------------
+    # Reset robot state
+    # ---------------------------------------------------------------
+    def _cancel_pos1_timer(self):
+        if self._pos1_timer:
+            self._pos1_timer.cancel()
+            self._pos1_timer = None
+
+    def _cancel_ocr_timer(self):
+        if self._ocr_timer:
+            self._ocr_timer.cancel()
+            self._ocr_timer = None
+
+    def _robot_reset_state(self):
+        with self._robot_state_lock:
+            self._robot_state        = 'idle'
+            self._pending_robot_name = None
+            self._pending_ocr_text   = None
+            self._pending_session_id = None
+            self._pending_name_result = None
+        self._cancel_pos1_timer()
+        self._cancel_ocr_timer()
+
+    # ===========================================================
+    # EXISTING CODE — unchanged below
+    # ===========================================================
 
     # ---------------------------------------------------------------
     # Session management
@@ -87,12 +366,11 @@ class DatabaseMatcherNode(Node):
             _, _, score, _ = self.matcher._enhanced_fuzzy_match(ocr_text, None, [product])
             scores.append((product, score))
         scores.sort(key=lambda x: x[1], reverse=True)
-        
-        # If only one product scores > 0, it's a unique match — no tie
+
         non_zero = [s for s in scores if s[1] > 0]
         if len(non_zero) <= 1:
             return False
-        
+
         if len(scores) >= 2:
             top_score = scores[0][1]
             second_score = scores[1][1]
@@ -177,7 +455,7 @@ class DatabaseMatcherNode(Node):
     # Timing log — full pipeline breakdown
     # ---------------------------------------------------------------
     def log_timing(self, callback_start, overall_start, end_to_end_from_ocr,
-               mode, scan_mode='sorting', per_camera=None, 
+               mode, scan_mode='sorting', per_camera=None,
                clock_offset=0.0, pi_cycle_time=None):
         matcher_time = time.time() - callback_start
         now = time.time()
@@ -185,7 +463,6 @@ class DatabaseMatcherNode(Node):
 
         self.get_logger().info('\n=== PIPELINE TIMING BREAKDOWN ===')
 
-        # ── Pi side ───────────────────────────────────────────────
         self.get_logger().info('  [Pi -- multi_camera_publisher]  (capture times: see Pi log)')
         if per_camera:
             for cam_id in sorted(per_camera.keys(), key=lambda x: int(x) if str(x).isdigit() else x):
@@ -197,7 +474,6 @@ class DatabaseMatcherNode(Node):
                     f'| network delay to WSL: {net:.3f}s'
                 )
 
-        # ── OCR node ──────────────────────────────────────────────
         self.get_logger().info('')
         self.get_logger().info('  [WSL -- ocr_node  (cameras processed in parallel)]')
         if per_camera:
@@ -217,18 +493,14 @@ class DatabaseMatcherNode(Node):
         elif end_to_end_from_ocr:
             self.get_logger().info(f'    ocr_node e2e: {end_to_end_from_ocr:.3f}s')
 
-        # ── Database matcher ──────────────────────────────────────
         self.get_logger().info('')
         self.get_logger().info('  [WSL -- database_matcher]')
         self.get_logger().info(f'    Matcher processing: {matcher_time:.3f}s')
 
-        # ── Total ─────────────────────────────────────────────────
         self.get_logger().info('')
         self.get_logger().info(f'  Mode: {mode} [{scan_mode}]')
 
         if pi_cycle_time and per_camera:
-            # Find when last camera fully finished on WSL
-            # = cam_offset + network_delay + OCR_time
             latest_finish = 0.0
             for cam_id in per_camera:
                 t = per_camera[cam_id].get('timing', {})
@@ -237,7 +509,7 @@ class DatabaseMatcherNode(Node):
                 ocr = t.get('total', 0.0)
                 finish = offset + network + ocr
                 latest_finish = max(latest_finish, finish)
-            
+
             true_e2e = latest_finish + matcher_time
             status = 'PASS' if true_e2e <= 3.0 else f'FAIL  (+{true_e2e - 3.0:.3f}s over target)'
             self.get_logger().info(f'  Pi capture cycle:   {pi_cycle_time:.3f}s')
@@ -258,7 +530,7 @@ class DatabaseMatcherNode(Node):
         self.get_logger().info('=================================')
 
     # ---------------------------------------------------------------
-    # Main callback
+    # Main callback — OCR results from ocr_node
     # ---------------------------------------------------------------
     def match_callback(self, msg):
         callback_start = time.time()
@@ -299,6 +571,79 @@ class DatabaseMatcherNode(Node):
                 f'scan will be FLAGGED for manual resolution'
             )
 
+        # ── Robot sorting: if we triggered this OCR, handle pass/fail ──
+        with self._robot_state_lock:
+            robot_waiting = self._robot_state == 'await_ocr'
+            pending_session = self._pending_session_id
+
+        if robot_waiting:
+            self._cancel_ocr_timer()
+            self.get_logger().info('[ROBOT] OCR result received — evaluating for pass/fail')
+            robot_barcode = barcodes[0] if barcodes else None
+
+            try:
+                result = self.matcher.match_and_save(
+                    ocr_text=ocr_text,
+                    barcode=robot_barcode,
+                    session_id=pending_session or self.get_or_create_session('sorting'),
+                    scan_mode='sorting'
+                )
+            except Exception as e:
+                self.get_logger().error(f'[ROBOT] SmartMatcher error: {e}')
+                result = None
+
+            accuracy = result['accuracy'] if result and result.get('matched') else 0.0
+            matched  = result and result.get('matched') and accuracy >= 95.0
+
+            details = (result.get('match_details') or {}) if result else {}
+            result_qty     = result.get('quantity') if result else None
+            result_qty_src = result.get('quantity_source', 'default') if result else 'default'
+
+            if matched:
+                product = result['product']
+                self.log_results(
+                    matched=True,
+                    product=product,
+                    accuracy=accuracy,
+                    confidence=result.get('confidence', 'HIGH'),
+                    verified=result.get('verified', True),
+                    barcode_used=robot_barcode,
+                    barcodes=[],
+                    ocr_text=ocr_text,
+                    details=details,
+                    quantity=result_qty,
+                    quantity_source=result_qty_src
+                )
+            else:
+                if result and result.get('scan_id'):
+                    self.matcher.db.update_scan(
+                        scan_id=result['scan_id'],
+                        match_confidence='LOW_CONFIDENCE',
+                        verified=0,
+                        notes=f'Camera match {accuracy:.1f}% — below 95% threshold'
+                    )
+                self.log_results(
+                    matched=False,
+                    product=None,
+                    accuracy=accuracy,
+                    confidence='LOW_CONFIDENCE',
+                    verified=False,
+                    barcode_used=None,
+                    barcodes=[],
+                    ocr_text=ocr_text,
+                    details=details,
+                    reason=f'camera match {accuracy:.1f}% below 95% threshold',
+                    quantity=result_qty,
+                    quantity_source=result_qty_src
+                )
+
+            self._publish_robot_command('pass' if matched else 'fail')
+            self._robot_reset_state()
+            self.log_timing(callback_start, overall_start, end_to_end_from_ocr,
+                            mode, scan_mode, per_camera, clock_offset, pi_cycle_time)
+            return
+
+        # ── Normal inbound/sorting OCR path (unchanged) ───────────
         session_id = self.get_or_create_session(scan_mode)
         all_products = self.matcher.db.get_all_products()
 
@@ -330,7 +675,7 @@ class DatabaseMatcherNode(Node):
                     session_id=session_id,
                     quantity=quantity,
                     quantity_source=quantity_source,
-                    scan_mode=scan_mode 
+                    scan_mode=scan_mode
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=0.0,
@@ -436,7 +781,7 @@ class DatabaseMatcherNode(Node):
                     session_id=session_id,
                     quantity=quantity,
                     quantity_source=quantity_source,
-                    scan_mode=scan_mode 
+                    scan_mode=scan_mode
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
@@ -464,12 +809,10 @@ class DatabaseMatcherNode(Node):
             except Exception as e:
                 self.get_logger().error(f'Exception in match_and_save: {e}')
             if result and result['matched'] and result.get('barcode_matched'):
-                # ── OCR vs barcode conflict check ─────────────────
                 barcode_product = result['product']
                 _, _, ocr_score, _ = self.matcher._enhanced_fuzzy_match(
                     ocr_text, None, [barcode_product]
                 )
-                # Check if OCR strongly matches a DIFFERENT product
                 for p in all_products:
                     if p[0] == barcode_product[0]:
                         continue
@@ -482,7 +825,6 @@ class DatabaseMatcherNode(Node):
                             f'but OCR strongly suggests "{p[1]}" '
                             f'(barcode_ocr={ocr_score:.1f} vs ocr_only={other_score:.1f})'
                         )
-                        # ── Delete matched scan, re-save as CONFLICT ──────────
                         if result and result.get('scan_id'):
                             self.matcher.db.delete_scan(result['scan_id'])
                         self.matcher.db.save_scan(
@@ -495,7 +837,7 @@ class DatabaseMatcherNode(Node):
                             session_id=session_id,
                             quantity=quantity,
                             quantity_source=quantity_source,
-                            scan_mode=scan_mode 
+                            scan_mode=scan_mode
                         )
                         _, _, _, conflict_details = self.matcher._enhanced_fuzzy_match(
                             ocr_text, None, all_products
@@ -529,7 +871,7 @@ class DatabaseMatcherNode(Node):
                     session_id=session_id,
                     quantity=quantity,
                     quantity_source=quantity_source,
-                    scan_mode=scan_mode 
+                    scan_mode=scan_mode
                 )
                 self.log_results(
                     matched=False, product=None, accuracy=50.0,
@@ -603,7 +945,6 @@ class DatabaseMatcherNode(Node):
                     quantity_source=result_qty_src
                 )
 
-                # ── Session running totals ────────────────────────
                 summary = self.matcher.db.get_quantity_by_stage(session_id=session_id)
                 self.get_logger().info(f'  Session {session_id} running totals (known qty):')
                 if summary:
