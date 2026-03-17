@@ -65,6 +65,7 @@ class DatabaseMatcherNode(Node):
         self._pending_ocr_text     = None  # split e.g. "Cream Lip Gloss"
         self._pending_session_id   = None
         self._pending_name_result  = None
+        self._pending_name_start   = None
         self._pos1_timer           = None
         self._ocr_timer            = None
 
@@ -133,6 +134,9 @@ class DatabaseMatcherNode(Node):
                 self.get_logger().info(f'  Source:    robot arm end-effector OCR')
                 self.get_logger().info(f'  Input:     "{robot_name}" → "{ocr_text}"')
                 self.get_logger().info(f'  Result:    PASS — name ≥95%, confirmed by pos1')
+                self.get_logger().info('')
+                self.get_logger().info('  [WSL -- database_matcher]')
+                self.get_logger().info(f'    Matcher processing: {self._pending_name_start:.3f}s')
                 self.get_logger().info('==========================================')
                 self._publish_robot_command('pass')
                 self._robot_reset_state()
@@ -174,9 +178,11 @@ class DatabaseMatcherNode(Node):
                 session_id=session_id,
                 scan_mode='sorting'
             )
+            db_time = time.time() - name_start
         except Exception as e:
             self.get_logger().error(f'[ROBOT] SmartMatcher error: {e}')
             result = None
+            db_time = 0.0
 
         accuracy = result['accuracy'] if result and result.get('matched') else 0.0
         matched  = result and result.get('matched') and accuracy >= 95.0
@@ -196,6 +202,7 @@ class DatabaseMatcherNode(Node):
                 self._pending_ocr_text    = ocr_text
                 self._pending_session_id  = session_id
                 self._pending_name_result = result  # stored for logging when pos1 arrives
+                self._pending_name_start  = db_time
 
             self._pos1_timer = threading.Timer(
                 self.POS1_TIMEOUT, self._on_pos1_timeout
@@ -302,6 +309,7 @@ class DatabaseMatcherNode(Node):
             self._pending_ocr_text   = None
             self._pending_session_id = None
             self._pending_name_result = None
+            self._pending_name_start = None
         self._cancel_pos1_timer()
         self._cancel_ocr_timer()
 

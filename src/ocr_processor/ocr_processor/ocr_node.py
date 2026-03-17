@@ -645,7 +645,7 @@ class OCRProcessor(Node):
     # ---------------------------------------------------------------
     OCR_CORRECTIONS = {
         'Gass': 'Gloss', 'Goss': 'Gloss', 'Gloss': 'Gloss', 'Gross': 'Gloss',
-        'Glosg': 'Gloss', 'Glogs': 'Gloss',
+        'Glosg': 'Gloss', 'Glogs': 'Gloss','Glo': 'Gloss', 'Glos': 'Gloss',
         'Stam': 'Stain', 'Stal': 'Stain', 'Stan': 'Stain', 'Stain': 'Stain',
         'Crean': 'Cream', 'Cram': 'Cream', 'Crear': 'Cream', 'Crearn': 'Cream',
         'Team': 'Cream', 'TEAM': 'Cream', 'Tearn': 'Cream', 'ream': 'Cream',
@@ -657,7 +657,7 @@ class OCRProcessor(Node):
         'aty:': 'Qty:', 'aty': 'Qty', 'Oty:': 'Qty:', 'Oty': 'Qty',
         'qty:': 'Qty:', 'QTY:': 'Qty:',
         'FRiDays': 'FRIDAYS','FRiDaYs': 'FRIDAYS','Fridays': 'FRIDAYS',
-        'FRIDAS': 'FRIDAYS',
+        'FRIDAS': 'FRIDAYS','FRIAYS': 'FRIDAYS', 'FRiAYS': 'FRIDAYS',
     }
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
@@ -690,7 +690,7 @@ class OCRProcessor(Node):
     'ban', 'say', 'Fal', 'iif', 'cae', 'wil', 'eam',
     'aty', 'mtt', 'MTT', 'IRA', 'Lee', 'aig', 'ait',
     'Bee', 'ges', 'pig', 'wer', 'Ake', 'ant', 'bal',
-    'pad', 'fig',
+    'pad', 'fig', 'ales', 'mss', 'ers'
 }
 
     def filter_barcode_text(self, text):
