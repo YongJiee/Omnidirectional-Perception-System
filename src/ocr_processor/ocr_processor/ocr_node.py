@@ -658,6 +658,7 @@ class OCRProcessor(Node):
         'qty:': 'Qty:', 'QTY:': 'Qty:',
         'FRiDays': 'FRIDAYS','FRiDaYs': 'FRIDAYS','Fridays': 'FRIDAYS',
         'FRIDAS': 'FRIDAYS','FRIAYS': 'FRIDAYS', 'FRiAYS': 'FRIDAYS',
+        'FRiAYS': 'FRIDAYS',
     }
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
