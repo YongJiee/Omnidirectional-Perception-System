@@ -323,16 +323,16 @@ class OCRProcessor(Node):
         code_time = time.time() - code_start
 
         ocr_start = time.time()
-        clean_text = self.extract_clean_text(ocr_region, psm=11, min_conf=40)
+        clean_text = self.extract_with_rotation(ocr_region, psm=11, min_conf=40)
 
         if not clean_text or len(clean_text.split()) < 2:
-            clean_text_psm6 = self.extract_clean_text(ocr_region, psm=6, min_conf=40)
+            clean_text_psm6 = self.extract_with_rotation(ocr_region, psm=6, min_conf=40)
             if clean_text_psm6 and len(clean_text_psm6.split()) > len((clean_text or '').split()):
                 clean_text = clean_text_psm6
                 self.get_logger().info(f'Cam {camera_id} {face_label}: PSM 6 improved OCR')
 
         if not clean_text:
-            clean_text_psm3 = self.extract_clean_text(ocr_region, psm=3, min_conf=35)
+            clean_text_psm3 = self.extract_with_rotation(ocr_region, psm=3, min_conf=35)
             if clean_text_psm3:
                 clean_text = clean_text_psm3
                 self.get_logger().info(f'Cam {camera_id} {face_label}: PSM 3 improved OCR')
@@ -377,7 +377,7 @@ class OCRProcessor(Node):
 
         split_start = time.time()
         split_col = self.find_split_column(gray)
-        overlap = int(width * 0.05)
+        overlap = int(width * 0.15)
         left_face = gray[:, :split_col + overlap]
         right_face = gray[:, split_col:]
         split_time = time.time() - split_start
@@ -413,9 +413,9 @@ class OCRProcessor(Node):
 
         # ── Run left face, right face, and full image OCR in parallel ──
         def run_full_ocr(region):
-            text = self.extract_clean_text(region, psm=11, min_conf=40)
+            text = self.extract_with_rotation(region, psm=11, min_conf=40)
             if not text or len(text.split()) < 2:
-                text = self.extract_clean_text(region, psm=6, min_conf=40)
+                text = self.extract_with_rotation(region, psm=6, min_conf=40)
             if text:
                 text = self.filter_barcode_text(text)
             return text
@@ -651,15 +651,41 @@ class OCRProcessor(Node):
         'Team': 'Cream', 'TEAM': 'Cream', 'Tearn': 'Cream', 'ream': 'Cream',
         'Lin': 'Lip', 'Lp': 'Lip', 'Liq': 'Lip', 'Li': 'Lip',
         'Crea': 'Cream',
+        'Painter': 'Painter', 'ainter': 'Painter', 'alnter': 'Painter', 
+        'Palnter': 'Painter',
         'SEPHOR': 'SEPHORA', 'SEPHOF': 'SEPHORA', 'SEPHO': 'SEPHORA',
         'sEPHORA': 'SEPHORA', 'sEPHOR': 'SEPHORA', 'Sephora': 'SEPHORA',
-        'SEPORA': 'SEPHORA', 'SEPHORS': 'SEPHORA',
+        'SEPORA': 'SEPHORA', 'SEPHORS': 'SEPHORA', 'SEPH': 'SEPHORA',
         'aty:': 'Qty:', 'aty': 'Qty', 'Oty:': 'Qty:', 'Oty': 'Qty',
         'qty:': 'Qty:', 'QTY:': 'Qty:',
+        'SUMME': 'SUMMER', 'UMMER': 'SUMMER', 'SUMM': 'SUMMER', 'SUM': 'SUMMER',
         'FRiDays': 'FRIDAYS','FRiDaYs': 'FRIDAYS','Fridays': 'FRIDAYS',
         'FRIDAS': 'FRIDAYS','FRIAYS': 'FRIDAYS', 'FRiAYS': 'FRIDAYS',
-        'FRiAYS': 'FRIDAYS',
+        'FRiAYS': 'FRIDAYS','RIDAYS': 'FRIDAYS', 'RIDAY': 'FRIDAYS',
+        'IDAYS': 'FRIDAYS', 'RIDAYS': 'FRIDAYS'
     }
+
+    def extract_with_rotation(self, image, psm=11, min_conf=40):
+        text_0 = self.extract_clean_text(image, psm=psm, min_conf=min_conf)
+
+        def score(t):
+            if not t:
+                return 0
+            # Only count words that are NOT known noise
+            return len([w for w in t.split() 
+                        if len(w) >= 3 and w not in self.OCR_NOISE_WORDS])
+
+        # Only skip 180° if 0° gave 3+ meaningful non-noise words
+        if score(text_0) >= 1:
+            return text_0
+
+        rotated_180 = cv2.rotate(image, cv2.ROTATE_180)
+        text_180 = self.extract_clean_text(rotated_180, psm=psm, min_conf=min_conf)
+
+        if score(text_180) > score(text_0):
+            self.get_logger().info(f'  Rotation 180° improved OCR: "{text_0}" → "{text_180}"')
+            return text_180
+        return text_0
 
     def extract_clean_text(self, image, psm=11, min_conf=40):
         gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -691,7 +717,8 @@ class OCRProcessor(Node):
     'ban', 'say', 'Fal', 'iif', 'cae', 'wil', 'eam',
     'aty', 'mtt', 'MTT', 'IRA', 'Lee', 'aig', 'ait',
     'Bee', 'ges', 'pig', 'wer', 'Ake', 'ant', 'bal',
-    'pad', 'fig', 'ales', 'mss', 'ers'
+    'pad', 'fig', 'mss', 'ers', 'wii', 'IWNS', 'iwns', 
+    'Wii', 'ales',
 }
 
     def filter_barcode_text(self, text):
