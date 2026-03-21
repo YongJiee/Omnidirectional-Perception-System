@@ -638,7 +638,6 @@ class OCRProcessor(Node):
         self.batch_save_dir = None
         self.clock_offset = None 
         self.pi_cycle_time = None
-        self.pi_cycle_time = None
 
     # ---------------------------------------------------------------
     # Helpers

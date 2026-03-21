@@ -15,4 +15,7 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Exclude all DB files except the product catalogue
 **/*.db
+!src/ocr_processor/data/cartoon_products.db

@@ -6,8 +6,6 @@ from std_msgs.msg import String
 from picamera2 import Picamera2
 import time
 import cv2
-import os
-from datetime import datetime
 
 RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -107,11 +105,6 @@ class MultiCameraPublisher(Node):
     def capture_all_cameras(self):
         self.overall_start = time.time()
         self.get_logger().info(f'=== Starting {self.num_cameras}-camera cycle ===')
-
-        # New save directory per scan
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.save_dir = f'/home/team9camera/camera_captures/{timestamp}'
-        os.makedirs(self.save_dir, exist_ok=True)
 
         results = []
         for camera_id in range(self.num_cameras):
