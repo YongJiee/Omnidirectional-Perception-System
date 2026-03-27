@@ -93,10 +93,11 @@ class TestImagePublisher(Node):
             self.get_logger().info('Capture complete — ready for next trigger')
 
     def _find_image(self, camera_id):
-        for ext in ['.jpg', '.png']:
-            path = os.path.join(self.image_dir, f'camera_{camera_id}{ext}')
-            if os.path.exists(path):
-                return path
+        for suffix in ['', '_received']:
+            for ext in ['.jpg', '.png']:
+                path = os.path.join(self.image_dir, f'camera_{camera_id}{suffix}{ext}')
+                if os.path.exists(path):
+                    return path
         return None
 
     def _check_images(self):

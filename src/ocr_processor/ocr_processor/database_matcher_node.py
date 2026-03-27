@@ -526,7 +526,7 @@ class DatabaseMatcherNode(Node):
             self.get_logger().info(
                 f'  TOTAL end-to-end:   {true_e2e:.3f}s  [{status}]'
             )
-        elif full_end_to_end is not None and 0 < full_end_to_end < 30:
+        elif full_end_to_end is not None and 0 < full_end_to_end < 600:
             status = 'PASS' if full_end_to_end <= 3.0 else f'FAIL  (+{full_end_to_end - 3.0:.3f}s over target)'
             self.get_logger().info(
                 f'  TOTAL end-to-end (Pi init -> OCR -> DB): {full_end_to_end:.3f}s  [{status}]'
@@ -556,6 +556,9 @@ class DatabaseMatcherNode(Node):
             data.get('camera_overall_start') or
             data.get('camera_capture_time')
         )
+        if data.get('injected'):
+            overall_start = callback_start
+
         end_to_end_from_ocr = data.get('end_to_end_time')
         clock_offset = data.get('clock_offset') or 0.0
         pi_cycle_time = data.get('pi_cycle_time')

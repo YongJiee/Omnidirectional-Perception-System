@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('lib/python3.10/site-packages/ocr_processor',
-            ['ocr_processor/cartoon_products.db']),  # ← add this
+            ['data/cartoon_products.db']),  # ← add this
     ],
     install_requires=['setuptools'],
     zip_safe=True,
