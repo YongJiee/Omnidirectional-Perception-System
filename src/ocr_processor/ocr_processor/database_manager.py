@@ -2,18 +2,44 @@ import sqlite3
 import os
 from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Resolve the DB path relative to this file's location so the module works
+# regardless of the working directory it is invoked from.
+# ---------------------------------------------------------------------------
 DB_PATH = os.path.join(os.path.dirname(__file__), 'cartoon_products.db')
 
 class DatabaseManager:
+    """
+    Central data-access layer for the OPS system.
+
+    Manages four SQLite tables:
+      products      — catalogue of known products with brand, keywords, barcode
+      scan_sessions — groups scans into inbound or sorting sessions
+      scans         — individual scan results with OCR text, match, confidence
+      inventory     — running quantity totals per product
+
+    All public methods open and close their own connection so this class is
+    safe to instantiate once and call from multiple ROS2 node callbacks.
+    """
+
     def __init__(self):
         self.db_path = DB_PATH
-        self.create_tables()
+        self.create_tables()  # Ensure schema exists before any other operation
     
     def create_tables(self):
+        """
+        Creates all four tables if they do not already exist.
+        Safe to call on every startup — IF NOT EXISTS prevents data loss.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Products table
+        # ------------------------------------------------------------------
+        # products — master catalogue of items the system can recognise.
+        # keywords stores OCR-friendly variants (typos, abbreviations) used
+        # by SmartMatcher to improve fuzzy matching recall.
+        # expected_barcode allows barcode-vs-OCR conflict detection.
+        # ------------------------------------------------------------------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +53,11 @@ class DatabaseManager:
             )
         ''')
 
-        # Scan sessions table
+        # ------------------------------------------------------------------
+        # scan_sessions — groups a set of scans under a single warehouse
+        # operation (inbound receiving or sorting). CHECK constraint prevents
+        # invalid stage values from being stored.
+        # ------------------------------------------------------------------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scan_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +68,16 @@ class DatabaseManager:
             )
         ''')
 
-        # Scans table
+        # ------------------------------------------------------------------
+        # scans — one row per package scan result.
+        # verified = 1 (HIGH/MEDIUM confidence) or 0 (LOW/NONE).
+        # quantity_source distinguishes how the unit count was obtained:
+        #   'ocr'      — read from box text by OCR
+        #   'default'  — assumed 1 unit (sorting fallback)
+        #   'flagged'  — could not be read; needs manual resolution
+        #   'resolved' — was flagged, later resolved by operator
+        # scan_mode stored directly (not via JOIN) for DB Browser visibility.
+        # ------------------------------------------------------------------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +98,11 @@ class DatabaseManager:
             )
         ''')
 
-        # Inventory table
+        # ------------------------------------------------------------------
+        # inventory — tracks cumulative stock per product.
+        # Updated automatically by save_scan() when a scan is verified and
+        # quantity is known (not flagged).
+        # ------------------------------------------------------------------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +120,11 @@ class DatabaseManager:
     # ==================== SESSION OPERATIONS ====================
 
     def create_session(self, stage, operator_notes=None):
-        """Create a new scan session. Returns session ID."""
+        """
+        Opens a new scan session for a warehouse operation.
+        stage must be 'inbound' or 'sorting' (enforced by DB CHECK constraint).
+        Returns the new session ID so callers can link scans to it.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -91,7 +138,10 @@ class DatabaseManager:
         return session_id
 
     def close_session(self, session_id):
-        """Mark a session as ended."""
+        """
+        Stamps ended_at on a session to mark it as complete.
+        Called when a batch of inbound/sorting scans is finished.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -102,7 +152,7 @@ class DatabaseManager:
         print(f"✓ Session {session_id} closed")
 
     def get_session(self, session_id):
-        """Get a session by ID."""
+        """Returns the full session row for a given ID, or None if not found."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM scan_sessions WHERE id = ?', (session_id,))
@@ -113,7 +163,11 @@ class DatabaseManager:
     # ==================== PRODUCT OPERATIONS ====================
     
     def add_product(self, product_name, brand, category, keywords, description, barcode=None):
-        """Add a new product to database"""
+        """
+        Inserts a new product into the catalogue and creates a matching
+        inventory row initialised to 0 units at 'Main Warehouse'.
+        Returns the new product ID.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -121,6 +175,8 @@ class DatabaseManager:
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (product_name, brand, category, keywords, description, barcode))
         product_id = cursor.lastrowid
+
+        # Immediately create an inventory row so JOIN queries always find a record
         cursor.execute('''
             INSERT INTO inventory (product_id, quantity, location)
             VALUES (?, ?, ?)
@@ -131,6 +187,7 @@ class DatabaseManager:
         return product_id
     
     def get_all_products(self):
+        """Returns all product rows ordered alphabetically by product_name."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM products ORDER BY product_name')
@@ -139,6 +196,7 @@ class DatabaseManager:
         return products
     
     def get_product_by_id(self, product_id):
+        """Returns a single product row by primary key, or None if not found."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM products WHERE id = ?', (product_id,))
@@ -147,6 +205,7 @@ class DatabaseManager:
         return product
     
     def view_all_products(self):
+        """Pretty-prints the full product catalogue to stdout."""
         products = self.get_all_products()
         if not products:
             print("\n⚠ No products in database!")
@@ -169,24 +228,35 @@ class DatabaseManager:
                   barcode=None, device_id=None, notes=None,
                   session_id=None, quantity=1, quantity_source='default', scan_mode='inbound'):
         """
-        Save scan result to database.
+        Persists one scan result and conditionally updates inventory.
 
-        quantity        — units detected. NULL if flagged (inbound, qty unreadable).
-        quantity_source — 'ocr'      : extracted from box text
-                          'default'  : sorting fallback (1 per item)
-                          'flagged'  : inbound, qty unknown — needs manual resolution
-        session_id      — links this scan to an inbound/sorting session
+        Parameters
+        ----------
+        ocr_text         : raw text extracted by Tesseract across all cameras
+        matched_product_id: FK to products table (None if no match found)
+        match_confidence : 'HIGH', 'MEDIUM', or 'LOW' — drives verified flag
+        match_score      : numeric score from SmartMatcher (0–100)
+        barcode          : barcode string if detected, else None
+        device_id        : identifier of the scanning device
+        notes            : free-text notes (e.g. conflict flags)
+        session_id       : links this scan to a session row
+        quantity         : unit count; None when quantity_source == 'flagged'
+        quantity_source  : 'ocr' | 'default' | 'flagged' | 'resolved'
+        scan_mode        : 'inbound' or 'sorting'
 
-        Inventory is only updated when:
-        - scan is verified AND
-        - quantity_source is not 'flagged'
+        Inventory update rules
+        ----------------------
+        - verified must be 1 (HIGH or MEDIUM confidence)
+        - matched_product_id must be set
+        - quantity_source must NOT be 'flagged' (unknown quantity)
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # HIGH and MEDIUM confidence scans are considered verified (trusted matches)
         verified = 1 if match_confidence in ['HIGH', 'MEDIUM'] else 0
 
-        # Store NULL in DB when flagged so it's excluded from SUM() queries
+        # Store NULL in DB for flagged scans so SUM() queries naturally exclude them
         db_quantity = None if quantity_source == 'flagged' else quantity
         
         cursor.execute('''
@@ -203,7 +273,7 @@ class DatabaseManager:
         
         scan_id = cursor.lastrowid
         
-        # Only update inventory if verified AND quantity is known
+        # Only credit inventory when the match is trusted and quantity is known
         if verified and matched_product_id and quantity_source != 'flagged':
             cursor.execute('''
                 UPDATE inventory 
@@ -218,12 +288,15 @@ class DatabaseManager:
 
     def resolve_flagged_scan(self, scan_id, quantity):
         """
-        Operator manually resolves a flagged scan by providing the quantity.
-        Updates the scan record and adds quantity to inventory.
+        Operator-driven resolution for scans where quantity could not be read.
+        Updates quantity_source to 'resolved', appends an audit note, and
+        credits inventory if the scan was verified.
+        Returns True on success, False if scan_id not found.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        # Fetch the scan to check it exists and whether it was verified
         cursor.execute('''
             SELECT matched_product_id, verified FROM scans WHERE id = ?
         ''', (scan_id,))
@@ -236,6 +309,7 @@ class DatabaseManager:
 
         matched_product_id, verified = row
 
+        # Update the scan with the operator-supplied quantity and audit trail
         cursor.execute('''
             UPDATE scans
             SET quantity = ?,
@@ -244,6 +318,7 @@ class DatabaseManager:
             WHERE id = ?
         ''', (quantity, scan_id))
 
+        # Credit inventory now that quantity is known (if match was trusted)
         if verified and matched_product_id:
             cursor.execute('''
                 UPDATE inventory
@@ -261,7 +336,11 @@ class DatabaseManager:
     # ==================== FLAGGED SCAN VIEWS ====================
 
     def get_flagged_scans(self):
-        """Get all inbound scans where quantity could not be read."""
+        """
+        Returns all scans where quantity_source == 'flagged' (quantity unknown).
+        JOINs products and scan_sessions to provide enough context for the
+        operator to manually identify and count the item.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -278,7 +357,10 @@ class DatabaseManager:
         return scans
 
     def view_flagged_scans(self):
-        """Display all flagged scans that need manual quantity resolution."""
+        """
+        Pretty-prints all unresolved flagged scans with the resolve command
+        hint so operators know exactly what action to take.
+        """
         scans = self.get_flagged_scans()
 
         print("\n" + "="*70)
@@ -303,13 +385,15 @@ class DatabaseManager:
 
     def get_quantity_by_stage(self, session_id=None):
         """
-        Return total known quantity per product per stage.
-        NULL (flagged) quantities are excluded from totals.
+        Aggregates known quantity per product per stage.
+        NULL (flagged) quantities are excluded from SUM() by SQL semantics.
+        Optionally filtered to a single session via session_id.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         if session_id:
+            # Filter to a specific session for real-time session reporting
             cursor.execute('''
                 SELECT ss.stage, p.product_name, p.brand, SUM(s.quantity) as total
                 FROM scans s
@@ -322,6 +406,7 @@ class DatabaseManager:
                 ORDER BY ss.stage, total DESC
             ''', (session_id,))
         else:
+            # No filter — aggregate across all sessions
             cursor.execute('''
                 SELECT ss.stage, p.product_name, p.brand, SUM(s.quantity) as total
                 FROM scans s
@@ -338,7 +423,11 @@ class DatabaseManager:
         return rows
 
     def view_quantity_summary(self, session_id=None):
-        """Display quantity summary by stage, with flagged count warning."""
+        """
+        Displays a stage-grouped quantity report.
+        Warns the operator if flagged scans exist so they know totals are
+        incomplete until all flagged items are resolved.
+        """
         rows = self.get_quantity_by_stage(session_id)
         flagged = self.get_flagged_scans()
 
@@ -355,6 +444,7 @@ class DatabaseManager:
             current_stage = None
             stage_total = 0
             for stage, product_name, brand, total in rows:
+                # Print a stage header whenever the stage changes
                 if stage != current_stage:
                     if current_stage is not None:
                         print(f"  {'─'*40}")
@@ -367,6 +457,7 @@ class DatabaseManager:
             print(f"  {'─'*40}")
             print(f"  Stage total (known): {stage_total} units")
 
+        # Warn operator that flagged scans are NOT included in the totals above
         if flagged:
             print(f"\n  ⚠ WARNING: {len(flagged)} flagged scan(s) with unknown quantity")
             print(f"  These are NOT included in totals above.")
@@ -377,6 +468,7 @@ class DatabaseManager:
     # ==================== EXISTING SCAN VIEWS ====================
     
     def get_verified_scans(self):
+        """Returns all scans with verified=1 (HIGH/MEDIUM confidence), newest first."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -392,6 +484,7 @@ class DatabaseManager:
         return scans
     
     def get_unverified_scans(self):
+        """Returns all scans with verified=0 (LOW confidence or no match), newest first."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -406,6 +499,7 @@ class DatabaseManager:
         return scans
     
     def get_scan_history(self, limit=10):
+        """Returns the most recent `limit` scans across all verification states."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -421,6 +515,7 @@ class DatabaseManager:
         return scans
     
     def view_verified_scans(self):
+        """Pretty-prints all verified scans with match and barcode details."""
         scans = self.get_verified_scans()
         if not scans:
             print("\n⚠ No verified scans!")
@@ -438,6 +533,7 @@ class DatabaseManager:
         print("="*70)
     
     def view_unverified_scans(self):
+        """Pretty-prints all unverified scans that need operator attention."""
         scans = self.get_unverified_scans()
         if not scans:
             print("\n✓ No unverified scans - all items matched!")
@@ -457,6 +553,7 @@ class DatabaseManager:
         print(f"\nTotal unverified: {len(scans)} items")
     
     def view_scan_history(self, limit=10):
+        """Pretty-prints the most recent `limit` scans with pass/fail icons."""
         scans = self.get_scan_history(limit)
         if not scans:
             print("\n⚠ No scan history!")
@@ -477,6 +574,10 @@ class DatabaseManager:
     # ==================== INVENTORY OPERATIONS ====================
     
     def get_inventory(self):
+        """
+        Returns current inventory levels for all products, ordered by
+        quantity descending so the most-stocked items appear first.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
@@ -490,6 +591,7 @@ class DatabaseManager:
         return inventory
     
     def view_inventory(self):
+        """Pretty-prints a full inventory report with location and last-scanned time."""
         inventory = self.get_inventory()
         print("\n" + "="*70)
         print("INVENTORY REPORT")
@@ -504,27 +606,50 @@ class DatabaseManager:
     # ==================== STATISTICS ====================
     
     def get_statistics(self):
+        """
+        Computes a summary statistics dict for the entire database:
+          total_products     — number of products in catalogue
+          total_scans        — all scan records
+          verified_count     — scans with verified=1
+          unverified_count   — scans with verified=0
+          flagged_count      — scans pending quantity resolution
+          by_confidence      — scan count grouped by match_confidence level
+          total_inventory    — sum of all inventory quantities
+          quantity_by_stage  — {stage: total_units} for verified, known-qty scans
+          verification_rate  — verified_count / total_scans * 100
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         stats = {}
+
         cursor.execute('SELECT COUNT(*) FROM products')
         stats['total_products'] = cursor.fetchone()[0]
+
         cursor.execute('SELECT COUNT(*) FROM scans')
         stats['total_scans'] = cursor.fetchone()[0]
+
         cursor.execute('SELECT COUNT(*) FROM scans WHERE verified = 1')
         stats['verified_count'] = cursor.fetchone()[0]
+
         cursor.execute('SELECT COUNT(*) FROM scans WHERE verified = 0')
         stats['unverified_count'] = cursor.fetchone()[0]
+
+        # Count scans still awaiting manual quantity resolution
         cursor.execute('SELECT COUNT(*) FROM scans WHERE quantity_source = ?', ('flagged',))
         stats['flagged_count'] = cursor.fetchone()[0]
+
+        # Distribution across HIGH / MEDIUM / LOW / CONFLICT confidence levels
         cursor.execute('''
             SELECT match_confidence, COUNT(*) 
             FROM scans 
             GROUP BY match_confidence
         ''')
         stats['by_confidence'] = cursor.fetchall()
+
         cursor.execute('SELECT SUM(quantity) FROM inventory')
         stats['total_inventory'] = cursor.fetchone()[0] or 0
+
+        # Per-stage quantity totals (NULL quantities from flagged scans excluded)
         cursor.execute('''
             SELECT ss.stage, SUM(s.quantity)
             FROM scans s
@@ -534,14 +659,18 @@ class DatabaseManager:
             GROUP BY ss.stage
         ''')
         stats['quantity_by_stage'] = dict(cursor.fetchall())
+
+        # Avoid division by zero when no scans exist yet
         if stats['total_scans'] > 0:
             stats['verification_rate'] = (stats['verified_count'] / stats['total_scans']) * 100
         else:
             stats['verification_rate'] = 0
+
         conn.close()
         return stats
     
     def view_statistics(self):
+        """Pretty-prints the full statistics report to stdout."""
         stats = self.get_statistics()
         print("\n" + "="*70)
         print("DATABASE STATISTICS")
@@ -568,6 +697,7 @@ class DatabaseManager:
     # ==================== UTILITY ====================
     
     def get_unverified_list(self):
+        """Returns a plain list of scan IDs where verified=0."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT id FROM scans WHERE verified = 0')
@@ -576,6 +706,7 @@ class DatabaseManager:
         return unverified_ids
     
     def get_verified_list(self):
+        """Returns a plain list of scan IDs where verified=1."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT id FROM scans WHERE verified = 1')
@@ -586,6 +717,10 @@ class DatabaseManager:
     # ==================== INITIALIZATION ====================
     
     def add_sample_products(self):
+        """
+        Seeds the database with three sample cosmetics products for testing.
+        Keywords include intentional OCR typo variants to exercise SmartMatcher.
+        """
         sample_products = [
             ('Sephora Lipstick V2', 'Sephora', 'Cosmetics',
              'lipstick, v2, makeup, 5ephora, sphora',
@@ -602,6 +737,7 @@ class DatabaseManager:
         print("\n✓ Sample products added successfully!")
 
     def delete_scan(self, scan_id):
+        """Permanently removes a scan record by ID (used for conflict cleanup)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('DELETE FROM scans WHERE id = ?', (scan_id,))
@@ -609,6 +745,11 @@ class DatabaseManager:
         conn.close()
 
     def update_scan(self, scan_id, match_confidence=None, verified=None, notes=None):
+        """
+        Partially updates a scan record. Only provided fields are changed;
+        omitted arguments leave the existing column values untouched.
+        Used for post-hoc corrections and conflict resolution overrides.
+        """
         fields = []
         values = []
         if match_confidence is not None:
@@ -621,7 +762,7 @@ class DatabaseManager:
             fields.append('notes = ?')
             values.append(notes)
         if not fields:
-            return
+            return  # Nothing to update — exit early
         values.append(scan_id)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -633,6 +774,10 @@ class DatabaseManager:
         conn.close()
 
 
+# ===========================================================================
+# Self-test — runs when the module is executed directly (not imported).
+# Exercises the full lifecycle: session → scan → flag → resolve → stats.
+# ===========================================================================
 if __name__ == "__main__":
     print("\n### DATABASE MANAGER TEST ###")
     db = DatabaseManager()
